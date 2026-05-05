@@ -1,5 +1,5 @@
 // testura-race-worker
-// 修正版：race_id取得 + EUC-JP取得 + 馬名HTMLタグ除去
+// 修正版：race_id取得 + EUC-JP取得 + 馬名HTMLタグ除去 + オッズ取得強化
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
@@ -16,7 +16,7 @@ export default {
     if (url.pathname === "/" || url.pathname === "/api/health") {
       return json({
         ok: true,
-        version: "namefix-eucjp-20240501",
+        version: "oddsfix-namefix-eucjp-20240501",
         endpoints: [
           "/api/debug-list?date=2026-05-02",
           "/api/race?date=2026-05-02&place=京都&raceNo=9"
@@ -265,13 +265,32 @@ async function getShutubaAndOdds(raceId) {
 
     const name = cleanText(stripTags(nameRaw));
 
-    let odds = cleanText(
-      stripTags(tr.match(/<td[^>]*Odds[^>]*>([\s\S]*?)<\/td>/i)?.[1] || "")
-    ).replace(/[^\d.]/g, "");
+    let odds = "";
 
+    // ① data-odds 優先
+    const dataOdds = tr.match(/data-odds=["']([^"']+)["']/i);
+    if (dataOdds) odds = dataOdds[1];
+
+    // ② オッズセル内 span
     if (!odds) {
-      odds = cleanText(tr.match(/data-odds=["']([^"']+)["']/i)?.[1] || "").replace(/[^\d.]/g, "");
+      const spanOdds = tr.match(/<td[^>]*Odds[^>]*>[\s\S]*?<span[^>]*>([\s\S]*?)<\/span>/i);
+      if (spanOdds) odds = spanOdds[1];
     }
+
+    // ③ オッズセルのテキスト
+    if (!odds) {
+      odds = cleanText(
+        stripTags(tr.match(/<td[^>]*Odds[^>]*>([\s\S]*?)<\/td>/i)?.[1] || "")
+      );
+    }
+
+    // ④ class名が人気系/odds系で違う場合の保険
+    if (!odds) {
+      const oddsLike = tr.match(/<td[^>]*(?:Popular|Odds|Txt_R)[^>]*>([\s\S]*?)<\/td>/i);
+      if (oddsLike) odds = stripTags(oddsLike[1]);
+    }
+
+    odds = cleanText(odds).replace(/[^\d.]/g, "");
 
     if (no || name) horses.push({ frame, no, name, odds, popularity: "" });
   }
