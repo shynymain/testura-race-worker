@@ -17,7 +17,7 @@ export default {
     if (url.pathname === "/" || url.pathname === "/api/health") {
       return json({
         ok: true,
-        version: "verify-no-odds-detail-racename-20240501",
+        version: "verify-no-odds-lastfix-20240501",
         purpose: "raceId from list, raceName/basic/horses/result from detail. odds disabled.",
         endpoints: [
           "/api/health",
@@ -80,7 +80,7 @@ export default {
 
       return json({
         ok: true,
-        mode: "verify-no-odds-detail-racename",
+        mode: "verify-no-odds-lastfix",
         validation,
         race,
         horses,
@@ -384,26 +384,44 @@ async function getShutuba(raceId) {
 }
 
 function parseRecentFinishesFromRow(tr) {
-  const text = stripTags(tr);
-  const raceResultLike = [];
-  const tokens = text.split(/\s+/).filter(Boolean);
+  // 前走着順取得 強化版
+  // tr全体ではなく td単位で後ろ側から「着順らしいセル」だけ拾う。
+  // 目的：騎手・斤量・日付・馬体重などの数字混入を減らす。
+  const cols = [...String(tr || "").matchAll(/<td[^>]*>([\s\S]*?)<\/td>/g)]
+    .map(x => stripTags(x[1]))
+    .map(x => cleanText(x))
+    .filter(Boolean);
 
-  for (const token of tokens) {
-    const t = token.replace(/[()（）]/g, "");
+  const nums = [];
+
+  // 後ろ側に近走成績があるケースが多いため、後ろから確認
+  for (let i = cols.length - 1; i >= 0; i--) {
+    const t = cols[i]
+      .replace(/[()（）]/g, "")
+      .replace(/着$/g, "")
+      .trim();
+
+    // 中止・除外・取消は 0 扱い
     if (/^(中止|除外|取消|取|除|中)$/.test(t)) {
-      raceResultLike.push("0");
+      nums.push("0");
     } else if (/^\d{1,2}$/.test(t)) {
       const n = Number(t);
-      if (n >= 1 && n <= 18) raceResultLike.push(String(n));
+      if (n >= 1 && n <= 18) nums.push(String(n));
     }
+
+    if (nums.length >= 3) break;
   }
 
-  if (raceResultLike.length < 3 || raceResultLike.length > 12) {
+  if (nums.length < 3) {
     return { last1: "", last2: "", last3: "" };
   }
 
-  const last3Tokens = raceResultLike.slice(-3);
-  return { last1: last3Tokens[2] || "", last2: last3Tokens[1] || "", last3: last3Tokens[0] || "" };
+  // 後ろから拾った順を「前走→前2走→前3走」として返す
+  return {
+    last1: nums[0] || "",
+    last2: nums[1] || "",
+    last3: nums[2] || ""
+  };
 }
 
 function calcJraFrame(no, headcount) {
