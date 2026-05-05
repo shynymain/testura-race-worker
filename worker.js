@@ -1,5 +1,6 @@
-// testura-race-worker
-// 最終API版：race_id取得 + EUC-JP取得 + 馬名HTMLタグ除去 + /api/race/odds/tan オッズ取得
+// testura-race-worker 検証用
+// 目的：netkeibaから「基本・枠・馬番・馬名・前走着順候補・結果」を取得
+// 注意：オッズ取得は完全に外す。odds/popularity は空で返す。
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
@@ -9,33 +10,32 @@ const CORS = {
 
 export default {
   async fetch(request) {
-    if (request.method === "OPTIONS") return new Response(null, { headers: CORS });
+    if (request.method === "OPTIONS") {
+      return new Response(null, { headers: CORS });
+    }
 
     const url = new URL(request.url);
 
     if (url.pathname === "/" || url.pathname === "/api/health") {
       return json({
         ok: true,
-        version: "odds-final-api-20240501",
+        version: "verify-no-odds-20240501",
+        purpose: "netkeiba basic/shutuba/result verification. odds disabled.",
         endpoints: [
+          "/api/health",
           "/api/debug-list?date=2026-05-02",
-          "/api/debug-odds?raceId=202608030309",
-          "/api/race?date=2026-05-02&place=京都&raceNo=9"
+          "/api/race?date=2026-05-02&place=京都&raceNo=9",
+          "/api/race?date=2026-05-03&place=京都&raceNo=11"
         ]
       });
     }
 
     if (url.pathname === "/api/debug-list") {
       const date = url.searchParams.get("date");
-      if (!date) return json({ ok: false, error: "date required" });
-      return json(await getRaceList(date, true));
-    }
+      if (!date) return json({ ok: false, error: "date required" }, 400);
 
-    if (url.pathname === "/api/debug-odds") {
-      const raceId = url.searchParams.get("raceId");
-      if (!raceId) return json({ ok: false, error: "raceId required" });
-      const odds = await getOddsFinal(raceId, true);
-      return json({ ok: true, raceId, odds });
+      const data = await getRaceList(date, true);
+      return json(data);
     }
 
     if (url.pathname === "/api/race") {
@@ -44,7 +44,10 @@ export default {
       const raceNo = normalizeRaceNo(url.searchParams.get("raceNo"));
 
       if (!date || !place || !raceNo) {
-        return json({ ok: false, error: "date/place/raceNo required" });
+        return json({
+          ok: false,
+          error: "date/place/raceNo required"
+        }, 400);
       }
 
       const listData = await getRaceList(date, false);
@@ -60,25 +63,33 @@ export default {
           ok: false,
           error: "race_id not found",
           input: { date, place, raceNo },
+          raceListStatus: listData.status || "",
           count: races.length,
           foundRaces: races
-        });
+        }, 404);
       }
 
-      const race = await getRaceBasic(target.raceId, date, place, raceNo);
-      const horses = await getShutubaAndOdds(target.raceId);
+      const raceBasic = await getRaceBasic(target.raceId, date, place, raceNo);
+      const horses = await getShutuba(target.raceId);
       const result = await getResult(target.raceId);
+
+      const race = {
+        ...raceBasic,
+        date: date.replaceAll("-", "/"),
+        place,
+        raceNo: String(Number(raceNo)),
+        raceId: target.raceId,
+        raceName: raceBasic.raceName || target.raceName || "",
+        headcount: String(horses.length)
+      };
+
+      const validation = validateRacePayload(race, horses, result);
 
       return json({
         ok: true,
-        race: {
-          ...race,
-          date: date.replaceAll("-", "/"),
-          place,
-          raceNo: String(Number(raceNo)),
-          raceId: target.raceId,
-          raceName: race.raceName || target.raceName || ""
-        },
+        mode: "verify-no-odds",
+        validation,
+        race,
         horses,
         result
       });
@@ -91,7 +102,10 @@ export default {
 function json(data, status = 200) {
   return new Response(JSON.stringify(data, null, 2), {
     status,
-    headers: { ...CORS, "Content-Type": "application/json; charset=utf-8" }
+    headers: {
+      ...CORS,
+      "Content-Type": "application/json; charset=utf-8"
+    }
   });
 }
 
@@ -104,12 +118,12 @@ function normalizeDate(date) {
   return String(date || "").replaceAll("-", "").replaceAll("/", "");
 }
 
-function commonHeaders() {
+function commonHeaders(referer = "https://race.netkeiba.com/") {
   return {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml,application/json;q=0.9,*/*;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml,application/json,text/plain,*/*;q=0.9",
     "Accept-Language": "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Referer": "https://race.netkeiba.com/"
+    "Referer": referer
   };
 }
 
@@ -128,11 +142,17 @@ async function fetchHtml(targetUrl) {
     }
   }
 
-  return { ok: res.ok, status: res.status, url: targetUrl, html };
+  return {
+    ok: res.ok,
+    status: res.status,
+    url: targetUrl,
+    html
+  };
 }
 
 async function getRaceList(date, includeDebug = false) {
   const ymd = normalizeDate(date);
+
   const urls = [
     `https://race.netkeiba.com/top/race_list_sub.html?kaisai_date=${ymd}`,
     `https://race.netkeiba.com/top/race_list.html?kaisai_date=${ymd}`
@@ -146,7 +166,14 @@ async function getRaceList(date, includeDebug = false) {
     const races = parseRaceListHtml(html);
 
     if (races.length > 0) {
-      return { ok: true, date, sourceUrl: targetUrl, status: fetched.status, count: races.length, races };
+      return {
+        ok: true,
+        date,
+        sourceUrl: targetUrl,
+        status: fetched.status,
+        count: races.length,
+        races
+      };
     }
 
     lastInfo = {
@@ -159,7 +186,14 @@ async function getRaceList(date, includeDebug = false) {
     };
   }
 
-  return { ok: true, date, status: "no races parsed", count: 0, races: [], debug: includeDebug ? lastInfo : undefined };
+  return {
+    ok: true,
+    date,
+    status: "no races parsed",
+    count: 0,
+    races: [],
+    debug: includeDebug ? lastInfo : undefined
+  };
 }
 
 function parseRaceListHtml(html) {
@@ -200,18 +234,36 @@ function detectPlace(text) {
 }
 
 function placeFromRaceId(raceId) {
+  // netkeiba/JRA系: YYYY + 場コード2桁 + 開催回2桁 + 開催日2桁 + R2桁 の想定
   const code = raceId.slice(4, 6);
   const map = {
-    "01": "札幌", "02": "函館", "03": "福島", "04": "新潟", "05": "東京",
-    "06": "中山", "07": "中京", "08": "京都", "09": "阪神", "10": "小倉"
+    "01": "札幌",
+    "02": "函館",
+    "03": "福島",
+    "04": "新潟",
+    "05": "東京",
+    "06": "中山",
+    "07": "中京",
+    "08": "京都",
+    "09": "阪神",
+    "10": "小倉"
   };
   return map[code] || "";
 }
 
 function guessRaceName(text, raceNo) {
   const t = cleanText(text);
-  const m = t.match(new RegExp(`${raceNo}R\\s+([^\\s]+)`));
-  return m ? m[1] : "";
+  const patterns = [
+    new RegExp(`${raceNo}R\\s+([^\\s]+)`),
+    new RegExp(`${raceNo}\\s*R\\s+([^\\s]+)`)
+  ];
+
+  for (const p of patterns) {
+    const m = t.match(p);
+    if (m && m[1]) return m[1];
+  }
+
+  return "";
 }
 
 async function getRaceBasic(raceId, date, place, raceNo) {
@@ -220,45 +272,86 @@ async function getRaceBasic(raceId, date, place, raceNo) {
 
   const title = cleanText(stripTags(html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1] || ""));
   const h1 = cleanText(stripTags(html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i)?.[1] || ""));
-  const raceName = h1 || title.split("|")[0].trim();
+  const raceName = cleanupRaceName(h1 || title.split("|")[0].trim());
 
   const infoText = stripTags(html);
 
-  const surface = infoText.includes("ダ") ? "ダート" : (infoText.includes("芝") ? "芝" : "");
-  const distMatch = infoText.match(/(芝|ダ|ダート)[^\d]{0,8}(\d{3,4})m/);
-  const distance = distMatch ? distMatch[2] : "";
+  const surface = parseSurface(infoText);
+  const distance = parseDistance(infoText);
+  const grade = parseGrade(infoText);
+  const condition = parseCondition(infoText);
+  const age = parseAge(infoText);
+  const sex = parseSex(infoText);
 
-  let grade = "";
-  if (infoText.includes("G1")) grade = "G1";
-  else if (infoText.includes("G2")) grade = "G2";
-  else if (infoText.includes("G3")) grade = "G3";
-  else if (infoText.includes("3勝クラス")) grade = "3勝";
-  else if (infoText.includes("2勝クラス")) grade = "2勝";
-  else if (infoText.includes("1勝クラス")) grade = "1勝";
-  else if (infoText.includes("オープン")) grade = "OP";
-
-  let condition = "定量";
-  if (infoText.includes("ハンデ")) condition = "ハンデ";
-  else if (infoText.includes("別定")) condition = "別定";
-
-  const ageMatch = infoText.match(/([2-5]歳以上|[2-4]歳)/);
-  const age = ageMatch ? ageMatch[1] : "";
-
-  const sex = infoText.includes("牝") ? "牝馬" : "混合";
-
-  return { date, place, raceNo, raceName, surface, distance, grade, condition, age, sex };
+  return {
+    date,
+    place,
+    raceNo,
+    raceName,
+    surface,
+    distance,
+    grade,
+    condition,
+    age,
+    sex
+  };
 }
 
-async function getShutubaAndOdds(raceId) {
-  const shutuba = await fetchHtml(`https://race.netkeiba.com/race/shutuba.html?race_id=${raceId}`);
-  const html = shutuba.html || "";
+function cleanupRaceName(s) {
+  return cleanText(String(s || "")
+    .replace(/出馬表.*$/, "")
+    .replace(/結果.*$/, "")
+    .replace(/オッズ.*$/, "")
+  );
+}
 
-  const oddsData = await getOddsFinal(raceId, false);
-  const oddsMap = oddsData.map || oddsData || {};
+function parseSurface(text) {
+  if (text.includes("障")) return "障害";
+  if (text.includes("ダ")) return "ダート";
+  if (text.includes("芝")) return "芝";
+  return "";
+}
 
+function parseDistance(text) {
+  const m = text.match(/(?:芝|ダ|ダート|障)[^\d]{0,10}(\d{3,4})m/);
+  return m ? m[1] : "";
+}
+
+function parseGrade(text) {
+  if (text.includes("G1")) return "G1";
+  if (text.includes("G2")) return "G2";
+  if (text.includes("G3")) return "G3";
+  if (text.includes("リステッド") || text.includes("L)")) return "L";
+  if (text.includes("オープン")) return "OP";
+  if (text.includes("3勝クラス")) return "3勝";
+  if (text.includes("2勝クラス")) return "2勝";
+  if (text.includes("1勝クラス")) return "1勝";
+  if (text.includes("未勝利")) return "未勝利";
+  if (text.includes("新馬")) return "新馬";
+  return "";
+}
+
+function parseCondition(text) {
+  if (text.includes("ハンデ")) return "ハンデ";
+  if (text.includes("別定")) return "別定";
+  return "定量";
+}
+
+function parseAge(text) {
+  const m = text.match(/([2-5]歳以上|[2-4]歳)/);
+  return m ? m[1] : "";
+}
+
+function parseSex(text) {
+  return text.includes("牝") ? "牝馬" : "混合";
+}
+
+async function getShutuba(raceId) {
+  const fetched = await fetchHtml(`https://race.netkeiba.com/race/shutuba.html?race_id=${raceId}`);
+  const html = fetched.html || "";
+
+  const rows = [...html.matchAll(/<tr[^>]*HorseList[^>]*>([\s\S]*?)<\/tr>/g)];
   const horses = [];
-  const rowRegex = /<tr[^>]*HorseList[^>]*>([\s\S]*?)<\/tr>/g;
-  const rows = [...html.matchAll(rowRegex)];
 
   for (const row of rows) {
     const tr = row[1];
@@ -267,9 +360,11 @@ async function getShutubaAndOdds(raceId) {
       stripTags(tr.match(/<td[^>]*Umaban[^>]*>([\s\S]*?)<\/td>/i)?.[1] || "")
     ).replace(/\D/g, "");
 
-    const frame = cleanText(
+    const frameByHtml = cleanText(
       stripTags(tr.match(/<td[^>]*Waku[^>]*>([\s\S]*?)<\/td>/i)?.[1] || "")
     ).replace(/\D/g, "");
+
+    const frame = frameByHtml || calcJraFrame(no, rows.length);
 
     const nameRaw =
       tr.match(/<span[^>]*HorseName[^>]*>[\s\S]*?<a[^>]*>([\s\S]*?)<\/a>/i)?.[1] ||
@@ -278,127 +373,136 @@ async function getShutubaAndOdds(raceId) {
 
     const name = cleanText(stripTags(nameRaw));
 
-    let odds = no && oddsMap[no] ? oddsMap[no] : "";
+    const last = parseRecentFinishesFromRow(tr);
 
-    odds = cleanText(odds).replace(/[^\d.]/g, "");
-
-    if (no || name) horses.push({ frame, no, name, odds, popularity: "" });
-  }
-
-  assignPopularity(horses);
-  return horses.sort((a, b) => Number(a.no) - Number(b.no));
-}
-
-async function getOddsFinal(raceId, includeDebug = false) {
-  const apiUrls = [
-    `https://race.netkeiba.com/api/race/odds/tan?race_id=${raceId}`,
-    `https://race.netkeiba.com/api/race/odds/tansho?race_id=${raceId}`,
-    `https://race.netkeiba.com/api/odds/tan?race_id=${raceId}`
-  ];
-
-  const tried = {};
-
-  for (const apiUrl of apiUrls) {
-    try {
-      const res = await fetch(apiUrl, {
-        headers: {
-          ...commonHeaders(),
-          "Accept": "application/json,text/plain,*/*",
-          "X-Requested-With": "XMLHttpRequest",
-          "Referer": `https://race.netkeiba.com/odds/index.html?race_id=${raceId}`
-        }
+    if (no || name) {
+      horses.push({
+        frame,
+        no,
+        name,
+        last1: last.last1 || "",
+        last2: last.last2 || "",
+        last3: last.last3 || "",
+        odds: "",
+        popularity: ""
       });
-
-      const text = await res.text();
-      let parsed = null;
-      try { parsed = JSON.parse(text); } catch { parsed = null; }
-
-      const map = parseOddsJson(parsed, text);
-
-      if (Object.keys(map).length > 0) {
-        return includeDebug
-          ? { sourceUrl: apiUrl, status: res.status, count: Object.keys(map).length, map, rawHead: text.slice(0, 500) }
-          : { map };
-      }
-
-      tried[apiUrl] = { status: res.status, length: text.length, head: text.slice(0, 300) };
-    } catch (e) {
-      tried[apiUrl] = { error: String(e) };
     }
   }
 
-  return includeDebug ? { count: 0, map: {}, tried } : { map: {} };
+  return horses.sort((a, b) => Number(a.no || 999) - Number(b.no || 999));
 }
 
-function parseOddsJson(parsed, rawText) {
-  const map = {};
+function parseRecentFinishesFromRow(tr) {
+  // 検証用：HTMLに着順らしき数字がある場合だけ候補取得。
+  // 誤取得防止のため、不明なら空欄。
+  const text = stripTags(tr);
 
-  function put(no, odds) {
-    no = String(no || "").replace(/\D/g, "");
-    odds = String(odds || "").replace(/[^\d.]/g, "");
-    if (no && odds && Number(no) >= 1 && Number(no) <= 18 && !map[no]) {
-      map[no] = odds;
+  // よくある「前走」「近走」セル全体から、着順らしい 1〜2桁/中/除/取 を拾う。
+  // ただし騎手・斤量・日付が混ざるので、最初は弱めにする。
+  const raceResultLike = [];
+
+  const tokens = text.split(/\s+/).filter(Boolean);
+  for (const token of tokens) {
+    const t = token.replace(/[()（）]/g, "");
+    if (/^(中止|除外|取消|取|除|中)$/.test(t)) {
+      raceResultLike.push("0");
+    } else if (/^\d{1,2}$/.test(t)) {
+      const n = Number(t);
+      if (n >= 1 && n <= 18) raceResultLike.push(String(n));
     }
   }
 
-  function walk(v) {
-    if (!v) return;
-
-    if (Array.isArray(v)) {
-      for (const item of v) walk(item);
-      return;
-    }
-
-    if (typeof v === "object") {
-      const no =
-        v.horse_no ?? v.umaban ?? v.no ?? v.num ?? v.number ??
-        v.horseNumber ?? v.HorseNum ?? v.Umaban ?? v.horse_num ?? v.horseNo;
-
-      const odds =
-        v.odds ?? v.win_odds ?? v.tan_odds ?? v.TanOdds ??
-        v.ninki_odds ?? v.value ?? v.o ?? v.tan;
-
-      if (no != null && odds != null) put(no, odds);
-
-      for (const key of Object.keys(v)) {
-        if (/^\d{1,2}$/.test(key) && typeof v[key] !== "object") put(key, v[key]);
-        walk(v[key]);
-      }
-    }
+  // 混入が多いため、取れすぎる場合は使わない
+  if (raceResultLike.length < 3 || raceResultLike.length > 12) {
+    return { last1: "", last2: "", last3: "" };
   }
 
-  walk(parsed);
+  // 末尾側に近走着順が出ることが多いため、最後の3つを候補にする
+  const last3Tokens = raceResultLike.slice(-3);
 
-  const patterns = [
-    /["'](?:horse_no|umaban|no|horse_num|horseNo)["']\s*:\s*["']?(\d{1,2})["']?[\s\S]{0,120}?["'](?:odds|win_odds|tan_odds|tan)["']\s*:\s*["']?(\d{1,3}\.\d)["']?/gi,
-    /["'](?:odds|win_odds|tan_odds|tan)["']\s*:\s*["']?(\d{1,3}\.\d)["']?[\s\S]{0,120}?["'](?:horse_no|umaban|no|horse_num|horseNo)["']\s*:\s*["']?(\d{1,2})["']?/gi,
-    /["'](\d{1,2})["']\s*:\s*["']?(\d{1,3}\.\d)["']?/g
-  ];
-
-  for (let i = 0; i < patterns.length; i++) {
-    const re = patterns[i];
-    let m;
-    while ((m = re.exec(rawText || "")) !== null) {
-      if (i === 1) put(m[2], m[1]);
-      else put(m[1], m[2]);
-    }
-  }
-
-  return map;
+  return {
+    // アプリ仕様：last1=前走, last2=前2走, last3=前3走
+    last1: last3Tokens[2] || "",
+    last2: last3Tokens[1] || "",
+    last3: last3Tokens[0] || ""
+  };
 }
 
-function assignPopularity(horses) {
-  const valid = horses
-    .filter(h => h.odds && h.odds !== "0")
-    .map(h => ({ no: h.no, odds: Number(h.odds) }))
-    .sort((a, b) => a.odds - b.odds);
+function calcJraFrame(no, headcount) {
+  const n = Number(no);
+  const h = Number(headcount);
+  if (!n || !h) return "";
 
-  let rank = 1;
-  for (let i = 0; i < valid.length; i++) {
-    if (i > 0 && valid[i].odds !== valid[i - 1].odds) rank = i + 1;
-    const h = horses.find(x => x.no === valid[i].no);
-    if (h) h.popularity = String(rank);
+  // JRAの一般的な枠順配分に近い簡易版。
+  // HTMLから枠が取れない時だけ使うfallback。
+  if (h <= 8) return String(n);
+
+  if (h === 9) {
+    if (n <= 7) return String(n);
+    return "8";
   }
+
+  if (h === 10) {
+    if (n <= 6) return String(n);
+    if (n <= 8) return "7";
+    return "8";
+  }
+
+  if (h === 11) {
+    if (n <= 5) return String(n);
+    if (n <= 7) return "6";
+    if (n <= 9) return "7";
+    return "8";
+  }
+
+  if (h === 12) {
+    if (n <= 4) return String(n);
+    if (n <= 6) return "5";
+    if (n <= 8) return "6";
+    if (n <= 10) return "7";
+    return "8";
+  }
+
+  if (h === 13) {
+    if (n <= 3) return String(n);
+    if (n <= 5) return "4";
+    if (n <= 7) return "5";
+    if (n <= 9) return "6";
+    if (n <= 11) return "7";
+    return "8";
+  }
+
+  if (h === 14) {
+    if (n <= 2) return String(n);
+    if (n <= 4) return "3";
+    if (n <= 6) return "4";
+    if (n <= 8) return "5";
+    if (n <= 10) return "6";
+    if (n <= 12) return "7";
+    return "8";
+  }
+
+  if (h === 15) {
+    if (n <= 1) return "1";
+    if (n <= 3) return "2";
+    if (n <= 5) return "3";
+    if (n <= 7) return "4";
+    if (n <= 9) return "5";
+    if (n <= 11) return "6";
+    if (n <= 13) return "7";
+    return "8";
+  }
+
+  // 16〜18頭
+  if (n <= 2) return "1";
+  if (n <= 4) return "2";
+  if (n <= 6) return "3";
+  if (n <= 8) return "4";
+  if (n <= 10) return "5";
+  if (n <= 12) return "6";
+  if (h === 16) return n <= 14 ? "7" : "8";
+  if (h === 17) return n <= 15 ? "7" : "8";
+  return n <= 15 ? "7" : "8";
 }
 
 async function getResult(raceId) {
@@ -415,19 +519,36 @@ async function getResult(raceId) {
     sanrenpukuPay: ""
   };
 
+  if (!html || !html.includes("Result")) {
+    return result;
+  }
+
   const rows = [...html.matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/g)];
 
   for (const row of rows) {
-    const text = stripTags(row[1]);
-    const chakujun = text.match(/^([123])\s+/);
-    if (!chakujun) continue;
+    const rowHtml = row[1];
+    const text = stripTags(rowHtml);
 
-    const nums = [...text.matchAll(/\b(\d{1,2})\b/g)].map(x => x[1]);
-    const horseNo = nums.find(n => Number(n) >= 1 && Number(n) <= 18) || "";
+    const rankMatch =
+      text.match(/^([123])\s+/) ||
+      text.match(/\s([123])\s+\d{1,2}\s+/);
 
-    if (chakujun[1] === "1") result.first = horseNo;
-    if (chakujun[1] === "2") result.second = horseNo;
-    if (chakujun[1] === "3") result.third = horseNo;
+    if (!rankMatch) continue;
+
+    const rank = rankMatch[1];
+
+    // Result_Num / Umabanなどから馬番を優先取得
+    let horseNo =
+      cleanText(stripTags(rowHtml.match(/<td[^>]*Umaban[^>]*>([\s\S]*?)<\/td>/i)?.[1] || "")).replace(/\D/g, "");
+
+    if (!horseNo) {
+      const nums = [...text.matchAll(/\b(\d{1,2})\b/g)].map(x => x[1]);
+      horseNo = nums.find(n => Number(n) >= 1 && Number(n) <= 18) || "";
+    }
+
+    if (rank === "1") result.first = horseNo;
+    if (rank === "2") result.second = horseNo;
+    if (rank === "3") result.third = horseNo;
   }
 
   const pageText = stripTags(html);
@@ -445,6 +566,40 @@ async function getResult(raceId) {
   }
 
   return result;
+}
+
+function validateRacePayload(race, horses, result) {
+  const warnings = [];
+
+  if (!race.raceId) warnings.push("raceId empty");
+  if (!race.raceName) warnings.push("raceName empty");
+  if (!race.surface) warnings.push("surface empty");
+  if (!race.distance) warnings.push("distance empty");
+  if (!horses.length) warnings.push("horses empty");
+
+  const noSet = new Set();
+  for (const h of horses) {
+    if (!h.no) warnings.push(`horse no empty: ${h.name || "unknown"}`);
+    if (!h.name) warnings.push(`horse name empty: no ${h.no || "?"}`);
+    if (String(h.name).includes("<") || String(h.name).includes(">")) {
+      warnings.push(`horse name html mixed: no ${h.no}`);
+    }
+    if (h.no) {
+      if (noSet.has(h.no)) warnings.push(`duplicate horse no: ${h.no}`);
+      noSet.add(h.no);
+    }
+  }
+
+  if (String(race.headcount || "") !== String(horses.length)) {
+    warnings.push(`headcount mismatch: race=${race.headcount}, horses=${horses.length}`);
+  }
+
+  return {
+    ok: warnings.length === 0,
+    warnings,
+    horseCount: horses.length,
+    resultExists: !!(result.first || result.second || result.third)
+  };
 }
 
 function stripTags(s) {
