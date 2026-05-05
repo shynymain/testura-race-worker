@@ -17,11 +17,12 @@ export default {
     if (url.pathname === "/" || url.pathname === "/api/health") {
       return json({
         ok: true,
-        version: "verify-no-odds-horsepage-td-final-v2-20240501",
+        version: "verify-no-odds-fetchfix-v2-20240501",
         purpose: "raceId/basic/horses/result from detail, last3 from horse page fallback. odds disabled.",
         endpoints: [
           "/api/health",
           "/api/debug-list?date=2026-05-02",
+          "/api/debug-horse?horseId=2023106995",
           "/api/race?date=2026-05-02&place=京都&raceNo=9",
           "/api/race?date=2026-05-03&place=京都&raceNo=11"
         ]
@@ -32,6 +33,25 @@ export default {
       const date = url.searchParams.get("date");
       if (!date) return json({ ok: false, error: "date required" }, 400);
       return json(await getRaceList(date, true));
+    }
+
+    if (url.pathname === "/api/debug-horse") {
+      const horseId = url.searchParams.get("horseId");
+      if (!horseId) return json({ ok: false, error: "horseId required" }, 400);
+
+      const fetched = await fetchHtml(`https://db.netkeiba.com/horse/${horseId}/`);
+      const html = fetched.html || "";
+      return json({
+        ok: true,
+        horseId,
+        status: fetched.status,
+        finalUrl: fetched.finalUrl || fetched.url,
+        htmlLength: html.length,
+        hasRaceTable: html.includes("db_h_race_results"),
+        hasTable: html.includes("<table"),
+        hasAccessDenied: /Access Denied|Forbidden|アクセス|captcha|Cloudflare/i.test(html),
+        head: html.slice(0, 1200)
+      });
     }
 
     if (url.pathname === "/api/race") {
@@ -80,7 +100,7 @@ export default {
 
       return json({
         ok: true,
-        mode: "verify-no-odds-horsepage-td-final",
+        mode: "verify-no-odds-fetchfix",
         validation,
         race,
         horses,
@@ -110,29 +130,63 @@ function normalizeDate(date) {
 
 function commonHeaders(referer = "https://race.netkeiba.com/") {
   return {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml,application/json,text/plain,*/*;q=0.9",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,application/json,text/plain,*/*;q=0.8",
     "Accept-Language": "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
     "Referer": referer
   };
 }
 
 async function fetchHtml(targetUrl) {
-  const res = await fetch(targetUrl, { headers: commonHeaders() });
+  const referer = targetUrl.includes("db.netkeiba.com")
+    ? "https://db.netkeiba.com/"
+    : "https://race.netkeiba.com/";
+
+  const res = await fetch(targetUrl, {
+    method: "GET",
+    redirect: "follow",
+    headers: commonHeaders(referer)
+  });
+
   const buffer = await res.arrayBuffer();
 
   let html = "";
+  // netkeibaはEUC-JPが多い。失敗時のみSJIS/UTF-8へfallback。
   try {
     html = new TextDecoder("EUC-JP").decode(buffer);
   } catch {
     try {
       html = new TextDecoder("shift_jis").decode(buffer);
     } catch {
-      html = new TextDecoder("utf-8").decode(buffer);
+      try {
+        html = new TextDecoder("utf-8").decode(buffer);
+      } catch {
+        html = "";
+      }
     }
   }
 
-  return { ok: res.ok, status: res.status, url: targetUrl, html };
+  // 文字化け保険：EUCで崩れた時にUTF-8の方が自然なら差し替える
+  try {
+    const utf8 = new TextDecoder("utf-8").decode(buffer);
+    if (
+      utf8 &&
+      utf8.includes("<html") &&
+      (!html.includes("<html") || html.includes("�"))
+    ) {
+      html = utf8;
+    }
+  } catch {}
+
+  return {
+    ok: res.ok,
+    status: res.status,
+    finalUrl: res.url,
+    url: targetUrl,
+    html
+  };
 }
 
 async function getRaceList(date, includeDebug = false) {
