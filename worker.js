@@ -1,5 +1,5 @@
 // testura-race-worker
-// 修正版：race_id取得 + EUC-JP取得 + 馬名HTMLタグ除去 + オッズ専用ページ取得
+// 修正版：race_id取得 + EUC-JP取得 + 馬名HTMLタグ除去 + netkeiba odds API取得
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
@@ -16,10 +16,11 @@ export default {
     if (url.pathname === "/" || url.pathname === "/api/health") {
       return json({
         ok: true,
-        version: "odds-page-eucjp-20240501",
+        version: "odds-api-eucjp-20240501",
         endpoints: [
           "/api/debug-list?date=2026-05-02",
-          "/api/race?date=2026-05-02&place=京都&raceNo=9"
+          "/api/race?date=2026-05-02&place=京都&raceNo=9",
+          "/api/debug-odds?raceId=202608030309"
         ]
       });
     }
@@ -28,6 +29,13 @@ export default {
       const date = url.searchParams.get("date");
       if (!date) return json({ ok: false, error: "date required" });
       return json(await getRaceList(date, true));
+    }
+
+    if (url.pathname === "/api/debug-odds") {
+      const raceId = url.searchParams.get("raceId");
+      if (!raceId) return json({ ok: false, error: "raceId required" });
+      const odds = await getOddsMapFromApi(raceId, true);
+      return json({ ok: true, raceId, odds });
     }
 
     if (url.pathname === "/api/race") {
@@ -98,12 +106,7 @@ function normalizeDate(date) {
 
 async function fetchHtml(targetUrl) {
   const res = await fetch(targetUrl, {
-    headers: {
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      "Accept-Language": "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7",
-      "Referer": "https://race.netkeiba.com/"
-    }
+    headers: commonHeaders()
   });
 
   const buffer = await res.arrayBuffer();
@@ -119,6 +122,15 @@ async function fetchHtml(targetUrl) {
   }
 
   return { ok: res.ok, status: res.status, url: targetUrl, html };
+}
+
+function commonHeaders() {
+  return {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml,application/json;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Referer": "https://race.netkeiba.com/"
+  };
 }
 
 async function getRaceList(date, includeDebug = false) {
@@ -241,12 +253,9 @@ async function getRaceBasic(raceId, date, place, raceNo) {
 
 async function getShutubaAndOdds(raceId) {
   const shutuba = await fetchHtml(`https://race.netkeiba.com/race/shutuba.html?race_id=${raceId}`);
-  const oddsPage = await fetchHtml(`https://race.netkeiba.com/odds/index.html?race_id=${raceId}`);
-
   const html = shutuba.html || "";
-  const oddsHtml = oddsPage.html || "";
 
-  const oddsMap = parseOddsPage(oddsHtml);
+  const oddsMap = await getOddsMapFromApi(raceId, false);
 
   const horses = [];
   const rowRegex = /<tr[^>]*HorseList[^>]*>([\s\S]*?)<\/tr>/g;
@@ -272,7 +281,7 @@ async function getShutubaAndOdds(raceId) {
 
     let odds = no && oddsMap[no] ? oddsMap[no] : "";
 
-    // 念のため出馬表HTML側もfallback
+    // fallback: 出馬表HTML
     if (!odds) {
       const dataOdds = tr.match(/data-odds=["']([^"']+)["']/i);
       if (dataOdds) odds = dataOdds[1];
@@ -298,32 +307,100 @@ async function getShutubaAndOdds(raceId) {
   return horses.sort((a, b) => Number(a.no) - Number(b.no));
 }
 
-function parseOddsPage(oddsHtml) {
-  const map = {};
+async function getOddsMapFromApi(raceId, includeRaw = false) {
+  const apiUrls = [
+    `https://race.netkeiba.com/api/odds?race_id=${raceId}`,
+    `https://race.netkeiba.com/api/api_get_jra_odds.html?race_id=${raceId}`,
+    `https://race.netkeiba.com/api/api_get_odds.html?race_id=${raceId}`
+  ];
 
-  // row単位で「馬番＋小数オッズ」を拾う
-  const rows = [...oddsHtml.matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/g)];
+  const result = {};
 
-  for (const row of rows) {
-    const tr = row[1];
-    const text = stripTags(tr);
+  for (const apiUrl of apiUrls) {
+    try {
+      const res = await fetch(apiUrl, {
+        headers: {
+          ...commonHeaders(),
+          "Accept": "application/json,text/plain,*/*",
+          "X-Requested-With": "XMLHttpRequest"
+        }
+      });
 
-    const nums = [...text.matchAll(/\b(\d{1,2})\b/g)].map(m => m[1]);
-    const no = nums.find(n => Number(n) >= 1 && Number(n) <= 18);
+      const text = await res.text();
 
-    const oddMatch = text.match(/\b(\d{1,3}\.\d)\b/);
+      let parsed = null;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        parsed = null;
+      }
 
-    if (no && oddMatch && !map[no]) {
-      map[no] = oddMatch[1];
+      const map = parseOddsJson(parsed, text);
+
+      if (Object.keys(map).length > 0) {
+        if (includeRaw) {
+          return { sourceUrl: apiUrl, count: Object.keys(map).length, map, rawHead: text.slice(0, 500) };
+        }
+        return map;
+      }
+
+      if (includeRaw) {
+        result[apiUrl] = { status: res.status, length: text.length, head: text.slice(0, 300) };
+      }
+    } catch (e) {
+      if (includeRaw) result[apiUrl] = { error: String(e) };
     }
   }
 
-  // HTML属性内に馬番/オッズがある場合の保険
-  const dataRows = [...oddsHtml.matchAll(/(?:data-horse-number|data-umaban|umaban)=["']?(\d{1,2})["']?[\s\S]{0,300}?(?:data-odds|odds)=["']?(\d{1,3}\.\d)["']?/gi)];
-  for (const m of dataRows) {
-    const no = m[1];
-    const odds = m[2];
-    if (!map[no]) map[no] = odds;
+  return includeRaw ? { count: 0, map: {}, tried: result } : {};
+}
+
+function parseOddsJson(parsed, rawText) {
+  const map = {};
+
+  function put(no, odds) {
+    no = String(no || "").replace(/\D/g, "");
+    odds = String(odds || "").replace(/[^\d.]/g, "");
+    if (no && odds && !map[no]) map[no] = odds;
+  }
+
+  function walk(v) {
+    if (!v) return;
+
+    if (Array.isArray(v)) {
+      for (const item of v) walk(item);
+      return;
+    }
+
+    if (typeof v === "object") {
+      const no =
+        v.horse_no ?? v.umaban ?? v.no ?? v.num ?? v.number ?? v.horseNumber ?? v.HorseNum ?? v.Umaban;
+      const odds =
+        v.odds ?? v.tan_odds ?? v.win_odds ?? v.TanOdds ?? v.ninki_odds ?? v.value;
+
+      if (no != null && odds != null) put(no, odds);
+
+      for (const key of Object.keys(v)) {
+        // keyが馬番、valueがオッズの形式にも対応
+        if (/^\d{1,2}$/.test(key) && typeof v[key] !== "object") put(key, v[key]);
+        walk(v[key]);
+      }
+    }
+  }
+
+  walk(parsed);
+
+  // raw text fallback: "horse_no":"1","odds":"3.5" 系
+  const patterns = [
+    /["'](?:horse_no|umaban|no)["']\s*:\s*["']?(\d{1,2})["']?[\s\S]{0,80}?["'](?:odds|tan_odds|win_odds)["']\s*:\s*["']?(\d{1,3}\.\d)["']?/gi,
+    /["'](\d{1,2})["']\s*:\s*["']?(\d{1,3}\.\d)["']?/g
+  ];
+
+  for (const re of patterns) {
+    let m;
+    while ((m = re.exec(rawText || "")) !== null) {
+      put(m[1], m[2]);
+    }
   }
 
   return map;
