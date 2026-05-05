@@ -1,5 +1,5 @@
 // testura-race-worker
-// 修正版：race_id取得 + EUC-JP取得 + 馬名HTMLタグ除去 + オッズ取得強化
+// 修正版：race_id取得 + EUC-JP取得 + 馬名HTMLタグ除去 + オッズ専用ページ取得
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
@@ -16,7 +16,7 @@ export default {
     if (url.pathname === "/" || url.pathname === "/api/health") {
       return json({
         ok: true,
-        version: "oddsfix-namefix-eucjp-20240501",
+        version: "odds-page-eucjp-20240501",
         endpoints: [
           "/api/debug-list?date=2026-05-02",
           "/api/race?date=2026-05-02&place=京都&raceNo=9"
@@ -240,8 +240,13 @@ async function getRaceBasic(raceId, date, place, raceNo) {
 }
 
 async function getShutubaAndOdds(raceId) {
-  const fetched = await fetchHtml(`https://race.netkeiba.com/race/shutuba.html?race_id=${raceId}`);
-  const html = fetched.html || "";
+  const shutuba = await fetchHtml(`https://race.netkeiba.com/race/shutuba.html?race_id=${raceId}`);
+  const oddsPage = await fetchHtml(`https://race.netkeiba.com/odds/index.html?race_id=${raceId}`);
+
+  const html = shutuba.html || "";
+  const oddsHtml = oddsPage.html || "";
+
+  const oddsMap = parseOddsPage(oddsHtml);
 
   const horses = [];
   const rowRegex = /<tr[^>]*HorseList[^>]*>([\s\S]*?)<\/tr>/g;
@@ -265,29 +270,23 @@ async function getShutubaAndOdds(raceId) {
 
     const name = cleanText(stripTags(nameRaw));
 
-    let odds = "";
+    let odds = no && oddsMap[no] ? oddsMap[no] : "";
 
-    // ① data-odds 優先
-    const dataOdds = tr.match(/data-odds=["']([^"']+)["']/i);
-    if (dataOdds) odds = dataOdds[1];
+    // 念のため出馬表HTML側もfallback
+    if (!odds) {
+      const dataOdds = tr.match(/data-odds=["']([^"']+)["']/i);
+      if (dataOdds) odds = dataOdds[1];
+    }
 
-    // ② オッズセル内 span
     if (!odds) {
       const spanOdds = tr.match(/<td[^>]*Odds[^>]*>[\s\S]*?<span[^>]*>([\s\S]*?)<\/span>/i);
       if (spanOdds) odds = spanOdds[1];
     }
 
-    // ③ オッズセルのテキスト
     if (!odds) {
       odds = cleanText(
         stripTags(tr.match(/<td[^>]*Odds[^>]*>([\s\S]*?)<\/td>/i)?.[1] || "")
       );
-    }
-
-    // ④ class名が人気系/odds系で違う場合の保険
-    if (!odds) {
-      const oddsLike = tr.match(/<td[^>]*(?:Popular|Odds|Txt_R)[^>]*>([\s\S]*?)<\/td>/i);
-      if (oddsLike) odds = stripTags(oddsLike[1]);
     }
 
     odds = cleanText(odds).replace(/[^\d.]/g, "");
@@ -297,6 +296,37 @@ async function getShutubaAndOdds(raceId) {
 
   assignPopularity(horses);
   return horses.sort((a, b) => Number(a.no) - Number(b.no));
+}
+
+function parseOddsPage(oddsHtml) {
+  const map = {};
+
+  // row単位で「馬番＋小数オッズ」を拾う
+  const rows = [...oddsHtml.matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/g)];
+
+  for (const row of rows) {
+    const tr = row[1];
+    const text = stripTags(tr);
+
+    const nums = [...text.matchAll(/\b(\d{1,2})\b/g)].map(m => m[1]);
+    const no = nums.find(n => Number(n) >= 1 && Number(n) <= 18);
+
+    const oddMatch = text.match(/\b(\d{1,3}\.\d)\b/);
+
+    if (no && oddMatch && !map[no]) {
+      map[no] = oddMatch[1];
+    }
+  }
+
+  // HTML属性内に馬番/オッズがある場合の保険
+  const dataRows = [...oddsHtml.matchAll(/(?:data-horse-number|data-umaban|umaban)=["']?(\d{1,2})["']?[\s\S]{0,300}?(?:data-odds|odds)=["']?(\d{1,3}\.\d)["']?/gi)];
+  for (const m of dataRows) {
+    const no = m[1];
+    const odds = m[2];
+    if (!map[no]) map[no] = odds;
+  }
+
+  return map;
 }
 
 function assignPopularity(horses) {
