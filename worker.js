@@ -17,7 +17,7 @@ export default {
     if (url.pathname === "/" || url.pathname === "/api/health") {
       return json({
         ok: true,
-        version: "verify-no-odds-horsepage-last-complete-v2-20240501",
+        version: "verify-no-odds-horsepage-last-safefix-v2-20240501",
         purpose: "raceId/basic/horses/result from detail, last3 from horse page fallback. odds disabled.",
         endpoints: [
           "/api/health",
@@ -80,7 +80,7 @@ export default {
 
       return json({
         ok: true,
-        mode: "verify-no-odds-horsepage-last-complete",
+        mode: "verify-no-odds-horsepage-last-safefix",
         validation,
         race,
         horses,
@@ -398,9 +398,9 @@ async function getShutuba(raceId) {
 }
 
 async function getHorseLastFinishes(horseId) {
-  // db.netkeiba 個別馬ページの戦績テーブルから近3走の着順を取得する完全修正版。
-  // 重要：テーブル全体ではなく db_h_race_results のみ対象。
-  // 着順列は基本的に 12列目相当（0始まり index=11）を優先。
+  // db.netkeiba 個別馬ページの戦績テーブルから近3走の着順を取得する安全版。
+  // 人気・馬番・枠番の混入を防ぐため、列固定だけに依存せず、
+  // 「日付・レース名がある戦績行」だけを対象にし、着順候補を安全判定する。
   const url = `https://db.netkeiba.com/horse/${horseId}/`;
   const fetched = await fetchHtml(url);
   const html = fetched.html || "";
@@ -426,27 +426,18 @@ async function getHorseLastFinishes(horseId) {
     const cols = [...rowHtml.matchAll(/<td[^>]*>([\s\S]*?)<\/td>/g)]
       .map(x => cleanText(stripTags(x[1])));
 
-    // 戦績行ではないものを除外
+    // 戦績行でないものを除外
     if (cols.length < 10) continue;
 
-    // netkeiba DB 戦績テーブルの標準列：
-    // 0日付,1開催,2天気,3R,4レース名,5映像,6頭数,7枠番,8馬番,9オッズ,10人気,11着順...
-    // 最優先は index 11。
-    let finish = normalizeFinishValue(cols[11]);
+    // 日付がない行は除外
+    if (!/^\d{4}\/\d{1,2}\/\d{1,2}/.test(cols[0] || "")) continue;
 
-    // 構造差の保険：着順列が10〜12あたりにズレる場合を吸収
-    if (!finish) {
-      const candidateIndexes = [10, 12, 9, 13];
-      for (const idx of candidateIndexes) {
-        const v = normalizeFinishValue(cols[idx]);
-        if (v) {
-          finish = v;
-          break;
-        }
-      }
-    }
+    // レース名がなさそうな行は除外
+    if (!cols[4] || cols[4].length < 2) continue;
 
+    const finish = pickSafeFinishFromHorseRow(cols);
     if (finish) finishes.push(finish);
+
     if (finishes.length >= 3) break;
   }
 
@@ -455,6 +446,28 @@ async function getHorseLastFinishes(horseId) {
     last2: finishes[1] || "",
     last3: finishes[2] || ""
   };
+}
+
+function pickSafeFinishFromHorseRow(cols) {
+  // netkeiba DBの標準列:
+  // 0日付,1開催,2天気,3R,4レース名,5映像,6頭数,7枠番,8馬番,9オッズ,10人気,11着順...
+  // 人気混入防止のため、基本的に index 11 以降を優先する。
+  // index 10以前は人気・オッズ・馬番・枠番が多いため、原則使わない。
+
+  const preferredIndexes = [11, 12, 13, 14];
+  for (const idx of preferredIndexes) {
+    const v = normalizeFinishValue(cols[idx]);
+    if (v) return v;
+  }
+
+  // 保険：着順セルには「1」「2」だけでなく「中止」「取消」「除外」が入る。
+  // ただし人気列混入を防ぐため、レース名以降かつ人気列より後だけ探索。
+  for (let i = 11; i < Math.min(cols.length, 18); i++) {
+    const v = normalizeFinishValue(cols[i]);
+    if (v) return v;
+  }
+
+  return "";
 }
 
 function parseRecentFinishesFromRow(tr) {
