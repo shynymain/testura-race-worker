@@ -1,5 +1,5 @@
 // testura-race-worker
-// 修正版：race_id取得 + EUC-JP取得 + 馬名HTMLタグ除去 + oddsページ __NUXT__ 抽出
+// 最終API版：race_id取得 + EUC-JP取得 + 馬名HTMLタグ除去 + /api/race/odds/tan オッズ取得
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
@@ -16,7 +16,7 @@ export default {
     if (url.pathname === "/" || url.pathname === "/api/health") {
       return json({
         ok: true,
-        version: "odds-nuxt-eucjp-20240501",
+        version: "odds-final-api-20240501",
         endpoints: [
           "/api/debug-list?date=2026-05-02",
           "/api/debug-odds?raceId=202608030309",
@@ -34,7 +34,7 @@ export default {
     if (url.pathname === "/api/debug-odds") {
       const raceId = url.searchParams.get("raceId");
       if (!raceId) return json({ ok: false, error: "raceId required" });
-      const odds = await getOddsFromNuxt(raceId, true);
+      const odds = await getOddsFinal(raceId, true);
       return json({ ok: true, raceId, odds });
     }
 
@@ -253,7 +253,7 @@ async function getShutubaAndOdds(raceId) {
   const shutuba = await fetchHtml(`https://race.netkeiba.com/race/shutuba.html?race_id=${raceId}`);
   const html = shutuba.html || "";
 
-  const oddsData = await getOddsFromNuxt(raceId, false);
+  const oddsData = await getOddsFinal(raceId, false);
   const oddsMap = oddsData.map || oddsData || {};
 
   const horses = [];
@@ -280,21 +280,6 @@ async function getShutubaAndOdds(raceId) {
 
     let odds = no && oddsMap[no] ? oddsMap[no] : "";
 
-    // fallback: 出馬表HTML
-    if (!odds) {
-      const dataOdds = tr.match(/data-odds=["']([^"']+)["']/i);
-      if (dataOdds) odds = dataOdds[1];
-    }
-    if (!odds) {
-      const spanOdds = tr.match(/<td[^>]*Odds[^>]*>[\s\S]*?<span[^>]*>([\s\S]*?)<\/span>/i);
-      if (spanOdds) odds = spanOdds[1];
-    }
-    if (!odds) {
-      odds = cleanText(
-        stripTags(tr.match(/<td[^>]*Odds[^>]*>([\s\S]*?)<\/td>/i)?.[1] || "")
-      );
-    }
-
     odds = cleanText(odds).replace(/[^\d.]/g, "");
 
     if (no || name) horses.push({ frame, no, name, odds, popularity: "" });
@@ -304,71 +289,50 @@ async function getShutubaAndOdds(raceId) {
   return horses.sort((a, b) => Number(a.no) - Number(b.no));
 }
 
-async function getOddsFromNuxt(raceId, includeDebug = false) {
-  const urls = [
-    `https://race.netkeiba.com/odds/index.html?race_id=${raceId}`,
-    `https://race.netkeiba.com/odds/index.html?type=b1&race_id=${raceId}`,
-    `https://race.netkeiba.com/odds/index.html?type=1&race_id=${raceId}`
+async function getOddsFinal(raceId, includeDebug = false) {
+  const apiUrls = [
+    `https://race.netkeiba.com/api/race/odds/tan?race_id=${raceId}`,
+    `https://race.netkeiba.com/api/race/odds/tansho?race_id=${raceId}`,
+    `https://race.netkeiba.com/api/odds/tan?race_id=${raceId}`
   ];
 
-  let debug = [];
+  const tried = {};
 
-  for (const targetUrl of urls) {
-    const fetched = await fetchHtml(targetUrl);
-    const html = fetched.html || "";
+  for (const apiUrl of apiUrls) {
+    try {
+      const res = await fetch(apiUrl, {
+        headers: {
+          ...commonHeaders(),
+          "Accept": "application/json,text/plain,*/*",
+          "X-Requested-With": "XMLHttpRequest",
+          "Referer": `https://race.netkeiba.com/odds/index.html?race_id=${raceId}`
+        }
+      });
 
-    const map = {};
+      const text = await res.text();
+      let parsed = null;
+      try { parsed = JSON.parse(text); } catch { parsed = null; }
 
-    // 1) __NUXT__ 形式
-    const nuxtMatch = html.match(/window\.__NUXT__\s*=\s*({[\s\S]*?});\s*<\/script>/) ||
-                      html.match(/__NUXT__\s*=\s*({[\s\S]*?});/);
+      const map = parseOddsJson(parsed, text);
 
-    if (nuxtMatch) {
-      try {
-        const nuxt = JSON.parse(nuxtMatch[1]);
-        walkOddsObject(nuxt, map);
-      } catch (e) {
-        debug.push({ url: targetUrl, nuxtParseError: String(e), nuxtHead: nuxtMatch[1].slice(0, 200) });
+      if (Object.keys(map).length > 0) {
+        return includeDebug
+          ? { sourceUrl: apiUrl, status: res.status, count: Object.keys(map).length, map, rawHead: text.slice(0, 500) }
+          : { map };
       }
-    }
 
-    // 2) JSON埋め込み / "odds":"3.5"系 fallback
-    if (Object.keys(map).length === 0) {
-      parseOddsFromRawText(html, map);
+      tried[apiUrl] = { status: res.status, length: text.length, head: text.slice(0, 300) };
+    } catch (e) {
+      tried[apiUrl] = { error: String(e) };
     }
-
-    // 3) HTML行 fallback
-    if (Object.keys(map).length === 0) {
-      const rows = [...html.matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/g)];
-      for (const row of rows) {
-        const text = stripTags(row[1]);
-        const nums = [...text.matchAll(/\b(\d{1,2})\b/g)].map(m => m[1]);
-        const no = nums.find(n => Number(n) >= 1 && Number(n) <= 18);
-        const oddMatch = text.match(/\b(\d{1,3}\.\d)\b/);
-        if (no && oddMatch && !map[no]) map[no] = oddMatch[1];
-      }
-    }
-
-    if (Object.keys(map).length > 0) {
-      return includeDebug
-        ? { sourceUrl: targetUrl, count: Object.keys(map).length, map, htmlLength: html.length, hasNuxt: !!nuxtMatch }
-        : { map };
-    }
-
-    debug.push({
-      url: targetUrl,
-      status: fetched.status,
-      htmlLength: html.length,
-      hasNuxt: html.includes("__NUXT__"),
-      hasOdds: html.includes("odds"),
-      head: html.slice(0, 300)
-    });
   }
 
-  return includeDebug ? { count: 0, map: {}, debug } : { map: {} };
+  return includeDebug ? { count: 0, map: {}, tried } : { map: {} };
 }
 
-function walkOddsObject(v, map) {
+function parseOddsJson(parsed, rawText) {
+  const map = {};
+
   function put(no, odds) {
     no = String(no || "").replace(/\D/g, "");
     odds = String(odds || "").replace(/[^\d.]/g, "");
@@ -377,56 +341,50 @@ function walkOddsObject(v, map) {
     }
   }
 
-  function walk(x) {
-    if (!x) return;
+  function walk(v) {
+    if (!v) return;
 
-    if (Array.isArray(x)) {
-      for (const item of x) walk(item);
+    if (Array.isArray(v)) {
+      for (const item of v) walk(item);
       return;
     }
 
-    if (typeof x === "object") {
+    if (typeof v === "object") {
       const no =
-        x.horse_no ?? x.umaban ?? x.no ?? x.num ?? x.number ??
-        x.horseNumber ?? x.HorseNum ?? x.Umaban ?? x.horse_num;
+        v.horse_no ?? v.umaban ?? v.no ?? v.num ?? v.number ??
+        v.horseNumber ?? v.HorseNum ?? v.Umaban ?? v.horse_num ?? v.horseNo;
 
       const odds =
-        x.win_odds ?? x.odds ?? x.tan_odds ?? x.TanOdds ??
-        x.ninki_odds ?? x.value ?? x.o;
+        v.odds ?? v.win_odds ?? v.tan_odds ?? v.TanOdds ??
+        v.ninki_odds ?? v.value ?? v.o ?? v.tan;
 
       if (no != null && odds != null) put(no, odds);
 
-      for (const key of Object.keys(x)) {
-        if (/^\d{1,2}$/.test(key) && typeof x[key] !== "object") put(key, x[key]);
-        walk(x[key]);
+      for (const key of Object.keys(v)) {
+        if (/^\d{1,2}$/.test(key) && typeof v[key] !== "object") put(key, v[key]);
+        walk(v[key]);
       }
     }
   }
 
-  walk(v);
-}
-
-function parseOddsFromRawText(text, map) {
-  function put(no, odds) {
-    no = String(no || "").replace(/\D/g, "");
-    odds = String(odds || "").replace(/[^\d.]/g, "");
-    if (no && odds && Number(no) >= 1 && Number(no) <= 18 && !map[no]) map[no] = odds;
-  }
+  walk(parsed);
 
   const patterns = [
-    /["'](?:horse_no|umaban|no|horse_num)["']\s*:\s*["']?(\d{1,2})["']?[\s\S]{0,100}?["'](?:win_odds|odds|tan_odds)["']\s*:\s*["']?(\d{1,3}\.\d)["']?/gi,
-    /["'](?:win_odds|odds|tan_odds)["']\s*:\s*["']?(\d{1,3}\.\d)["']?[\s\S]{0,100}?["'](?:horse_no|umaban|no|horse_num)["']\s*:\s*["']?(\d{1,2})["']?/gi,
+    /["'](?:horse_no|umaban|no|horse_num|horseNo)["']\s*:\s*["']?(\d{1,2})["']?[\s\S]{0,120}?["'](?:odds|win_odds|tan_odds|tan)["']\s*:\s*["']?(\d{1,3}\.\d)["']?/gi,
+    /["'](?:odds|win_odds|tan_odds|tan)["']\s*:\s*["']?(\d{1,3}\.\d)["']?[\s\S]{0,120}?["'](?:horse_no|umaban|no|horse_num|horseNo)["']\s*:\s*["']?(\d{1,2})["']?/gi,
     /["'](\d{1,2})["']\s*:\s*["']?(\d{1,3}\.\d)["']?/g
   ];
 
   for (let i = 0; i < patterns.length; i++) {
     const re = patterns[i];
     let m;
-    while ((m = re.exec(text || "")) !== null) {
+    while ((m = re.exec(rawText || "")) !== null) {
       if (i === 1) put(m[2], m[1]);
       else put(m[1], m[2]);
     }
   }
+
+  return map;
 }
 
 function assignPopularity(horses) {
