@@ -17,7 +17,7 @@ export default {
     if (url.pathname === "/" || url.pathname === "/api/health") {
       return json({
         ok: true,
-        version: "verify-no-odds-horsepage-last-v2-20240501",
+        version: "verify-no-odds-horsepage-last-complete-v2-20240501",
         purpose: "raceId/basic/horses/result from detail, last3 from horse page fallback. odds disabled.",
         endpoints: [
           "/api/health",
@@ -80,7 +80,7 @@ export default {
 
       return json({
         ok: true,
-        mode: "verify-no-odds-horsepage-last",
+        mode: "verify-no-odds-horsepage-last-complete",
         validation,
         race,
         horses,
@@ -398,42 +398,56 @@ async function getShutuba(raceId) {
 }
 
 async function getHorseLastFinishes(horseId) {
-  // db.netkeibaの個別馬ページから近3走の着順を取得。
-  // 取得できない場合は空欄で返す。誤取得より空欄優先。
+  // db.netkeiba 個別馬ページの戦績テーブルから近3走の着順を取得する完全修正版。
+  // 重要：テーブル全体ではなく db_h_race_results のみ対象。
+  // 着順列は基本的に 12列目相当（0始まり index=11）を優先。
   const url = `https://db.netkeiba.com/horse/${horseId}/`;
   const fetched = await fetchHtml(url);
   const html = fetched.html || "";
 
-  const finishes = [];
+  const tableMatch =
+    html.match(/<table[^>]*class=["'][^"']*db_h_race_results[^"']*["'][^>]*>[\s\S]*?<\/table>/i) ||
+    html.match(/<table[^>]*db_h_race_results[^>]*>[\s\S]*?<\/table>/i);
 
-  // 戦績テーブルのtrを順に見る。上から新しい順のケースが多い。
-  const rows = [...html.matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/g)];
-
-  for (const row of rows) {
-    const tr = row[1];
-
-    // ヘッダーや年度集計を除外
-    const text = stripTags(tr);
-    if (!text || text.includes("日付") || text.includes("レース名") || text.includes("通算")) continue;
-
-    const cols = [...tr.matchAll(/<td[^>]*>([\s\S]*?)<\/td>/g)].map(x => cleanText(stripTags(x[1])));
-    if (cols.length < 8) continue;
-
-    // netkeiba DBの戦績列は通常「着順」が4〜7列目あたりにあるが、構造差があるため候補を探す。
-    // レース名/人気/着順/騎手/斤量... のうち、着順セルらしい値だけ採用。
-    const candidates = cols.slice(0, 12).map(normalizeFinishValue).filter(Boolean);
-
-    // 候補が複数出た場合、順位として自然な最初の値を採用。
-    // 人気なども数字なので混ざる可能性があるが、戦績表では着順列が前半にある。
-    if (candidates.length > 0) {
-      finishes.push(candidates[0]);
-    }
-
-    if (finishes.length >= 3) break;
+  if (!tableMatch) {
+    return { last1: "", last2: "", last3: "" };
   }
 
-  if (finishes.length < 3) {
-    return { last1: "", last2: "", last3: "" };
+  const table = tableMatch[0];
+  const rows = [...table.matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/g)];
+  const finishes = [];
+
+  for (const row of rows) {
+    const rowHtml = row[1];
+
+    // ヘッダー除外
+    if (/<th[\s\S]*?>/i.test(rowHtml)) continue;
+
+    const cols = [...rowHtml.matchAll(/<td[^>]*>([\s\S]*?)<\/td>/g)]
+      .map(x => cleanText(stripTags(x[1])));
+
+    // 戦績行ではないものを除外
+    if (cols.length < 10) continue;
+
+    // netkeiba DB 戦績テーブルの標準列：
+    // 0日付,1開催,2天気,3R,4レース名,5映像,6頭数,7枠番,8馬番,9オッズ,10人気,11着順...
+    // 最優先は index 11。
+    let finish = normalizeFinishValue(cols[11]);
+
+    // 構造差の保険：着順列が10〜12あたりにズレる場合を吸収
+    if (!finish) {
+      const candidateIndexes = [10, 12, 9, 13];
+      for (const idx of candidateIndexes) {
+        const v = normalizeFinishValue(cols[idx]);
+        if (v) {
+          finish = v;
+          break;
+        }
+      }
+    }
+
+    if (finish) finishes.push(finish);
+    if (finishes.length >= 3) break;
   }
 
   return {
