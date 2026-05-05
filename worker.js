@@ -9,7 +9,8 @@ const CORS = {
 };
 
 export default {
-  async fetch(request) {
+  async fetch(request, env) {
+    globalThis.PROXY_BASE = env && env.PROXY_BASE ? env.PROXY_BASE : "";
     if (request.method === "OPTIONS") return new Response(null, { headers: CORS });
 
     const url = new URL(request.url);
@@ -17,12 +18,12 @@ export default {
     if (url.pathname === "/" || url.pathname === "/api/health") {
       return json({
         ok: true,
-        version: "B-racepage-only-v2-20240501",
+        version: "A-proxy-verify-v2-20240501",
         purpose: "raceId/basic/horses/result from detail, last3 from horse page fallback. odds disabled.",
         endpoints: [
           "/api/health",
           "/api/debug-list?date=2026-05-02",
-          "/api/debug-horse?horseId=2023106995",
+          "/api/debug-proxy-horse?horseId=2023106995",
           "/api/race?date=2026-05-02&place=京都&raceNo=9",
           "/api/race?date=2026-05-03&place=京都&raceNo=11"
         ]
@@ -36,10 +37,45 @@ export default {
     }
 
     if (url.pathname === "/api/debug-horse") {
+      const horseId = url.searchParams.get("horseId");
+      if (!horseId) return json({ ok: false, error: "horseId required" }, 400);
+
+      const fetched = await fetchHtml(`https://db.netkeiba.com/horse/${horseId}/`);
+      const html = fetched.html || "";
       return json({
         ok: true,
-        mode: "B-racepage-only",
-        message: "B案ではdb.netkeiba.comの馬個別ページを使いません。前走はrace.netkeiba.comの出馬表内にある場合のみ取得します。"
+        horseId,
+        status: fetched.status,
+        finalUrl: fetched.finalUrl || fetched.url,
+        htmlLength: html.length,
+        hasRaceTable: html.includes("db_h_race_results"),
+        hasTable: html.includes("<table"),
+        hasAccessDenied: /Access Denied|Forbidden|アクセス|captcha|Cloudflare/i.test(html),
+        head: html.slice(0, 1200)
+      });
+    }
+
+    if (url.pathname === "/api/debug-proxy-horse") {
+      const horseId = url.searchParams.get("horseId") || "2023106995";
+      const directUrl = `https://db.netkeiba.com/horse/${horseId}/`;
+      const target = globalThis.PROXY_BASE
+        ? `${globalThis.PROXY_BASE}${encodeURIComponent(directUrl)}`
+        : directUrl;
+
+      const fetched = await fetchHtml(target);
+      const html = fetched.html || "";
+      return json({
+        ok: true,
+        mode: "A-proxy",
+        horseId,
+        proxyEnabled: !!globalThis.PROXY_BASE,
+        proxyBase: globalThis.PROXY_BASE ? "set" : "not set",
+        status: fetched.status,
+        finalUrl: fetched.finalUrl || fetched.url,
+        htmlLength: html.length,
+        hasRaceTable: html.includes("db_h_race_results"),
+        hasAccessDenied: /Access Denied|Forbidden|captcha|Cloudflare|アクセス/i.test(html),
+        head: html.slice(0, 1000)
       });
     }
 
@@ -89,7 +125,7 @@ export default {
 
       return json({
         ok: true,
-        mode: "B-racepage-only",
+        mode: "A-proxy-verify",
         validation,
         race,
         horses,
@@ -386,9 +422,6 @@ function parseSex(text) {
 }
 
 async function getShutuba(raceId) {
-  // B案：レースページ完結版
-  // db.netkeiba.com の馬個別ページは使わない。
-  // race.netkeiba.com の出馬表HTMLから取れる範囲だけ取得する。
   const fetched = await fetchHtml(`https://race.netkeiba.com/race/shutuba.html?race_id=${raceId}`);
   const html = fetched.html || "";
 
@@ -399,7 +432,9 @@ async function getShutuba(raceId) {
     const tr = row[1];
 
     const no = cleanText(stripTags(tr.match(/<td[^>]*Umaban[^>]*>([\s\S]*?)<\/td>/i)?.[1] || "")).replace(/\D/g, "");
+
     const frameByHtml = cleanText(stripTags(tr.match(/<td[^>]*Waku[^>]*>([\s\S]*?)<\/td>/i)?.[1] || "")).replace(/\D/g, "");
+
     const frame = frameByHtml || calcJraFrame(no, rows.length);
 
     const horseLink =
@@ -415,9 +450,13 @@ async function getShutuba(raceId) {
 
     const name = cleanText(stripTags(nameRaw));
 
-    // 出馬表ページ内で取れる場合のみ前走候補を入れる。
-    // 取れなければ空欄。db.netkeibaへは行かない。
-    const last = parseRecentFinishesFromRow(tr);
+    // まず出馬表内から取得。不足なら個別馬ページで補完。
+    let last = parseRecentFinishesFromRow(tr);
+
+    if ((!last.last1 || !last.last2 || !last.last3) && horseLink) {
+      const hp = await getHorseLastFinishes(horseLink);
+      if (hp.last1 || hp.last2 || hp.last3) last = hp;
+    }
 
     if (no || name) {
       horses.push({
@@ -436,6 +475,81 @@ async function getShutuba(raceId) {
 
   return horses.sort((a, b) => Number(a.no || 999) - Number(b.no || 999));
 }
+
+async function getHorseLastFinishes(horseId) {
+  // A案：プロキシ検証版
+  // Workerからdb.netkeiba.comを直接叩くとAccessDeniedになるため、
+  // env.PROXY_BASE があればプロキシ経由でHTMLを取得する。
+  // 例: PROXY_BASE=https://your-proxy.example.com/fetch?url=
+  const directUrl = `https://db.netkeiba.com/horse/${horseId}/`;
+
+  let fetched;
+  if (typeof globalThis.PROXY_BASE !== "undefined" && globalThis.PROXY_BASE) {
+    fetched = await fetchHtml(`${globalThis.PROXY_BASE}${encodeURIComponent(directUrl)}`);
+  } else {
+    // envが使えない環境向け fallback。直接取得も試すが、ブロックされる可能性が高い。
+    fetched = await fetchHtml(directUrl);
+  }
+
+  const html = fetched.html || "";
+
+  const tableMatch =
+    html.match(/<table[^>]*class=["'][^"']*db_h_race_results[^"']*["'][^>]*>[\s\S]*?<\/table>/i) ||
+    html.match(/<table[^>]*db_h_race_results[^>]*>[\s\S]*?<\/table>/i);
+
+  if (!tableMatch) return { last1: "", last2: "", last3: "" };
+
+  const table = tableMatch[0];
+  const rows = [...table.matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/gi)];
+  const finishes = [];
+
+  for (const row of rows) {
+    const rowHtml = row[1];
+    if (/<th[\s\S]*?>/i.test(rowHtml)) continue;
+
+    const cols = extractTdValues(rowHtml);
+    if (cols.length < 8) continue;
+
+    const hasDate = cols.slice(0, 3).some(c => /^\d{4}\/\d{1,2}\/\d{1,2}/.test(c));
+    if (!hasDate) continue;
+
+    const finish = pickSafeFinishFromHorseRow(cols);
+    if (finish) finishes.push(finish);
+    if (finishes.length >= 3) break;
+  }
+
+  return {
+    last1: finishes[0] || "",
+    last2: finishes[1] || "",
+    last3: finishes[2] || ""
+  };
+}
+
+function extractTdValues(rowHtml) {
+  const tdMatches = [...String(rowHtml || "").matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi)];
+  return tdMatches.map(m =>
+    cleanText(stripTags(m[1]).replace(/\r?\n/g, " ").replace(/\t/g, " "))
+  ).filter(v => v !== "");
+}
+
+function pickSafeFinishFromHorseRow(cols) {
+  const preferredIndexes = [11, 12, 13, 14];
+  for (const idx of preferredIndexes) {
+    const v = normalizeFinishValue(cols[idx]);
+    if (v) return v;
+  }
+
+  for (let i = 0; i < cols.length; i++) {
+    if (i === 7 || i === 8 || i === 9 || i === 10) continue;
+    if (i <= 6) continue;
+    const v = normalizeFinishValue(cols[i]);
+    if (v) return v;
+  }
+
+  return "";
+}
+
+
 
 function parseRecentFinishesFromRow(tr) {
   // 前走着順取得 v2
