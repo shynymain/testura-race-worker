@@ -17,7 +17,7 @@ export default {
     if (url.pathname === "/" || url.pathname === "/api/health") {
       return json({
         ok: true,
-        version: "verify-no-odds-fetchfix-v2-20240501",
+        version: "B-racepage-only-v2-20240501",
         purpose: "raceId/basic/horses/result from detail, last3 from horse page fallback. odds disabled.",
         endpoints: [
           "/api/health",
@@ -36,21 +36,10 @@ export default {
     }
 
     if (url.pathname === "/api/debug-horse") {
-      const horseId = url.searchParams.get("horseId");
-      if (!horseId) return json({ ok: false, error: "horseId required" }, 400);
-
-      const fetched = await fetchHtml(`https://db.netkeiba.com/horse/${horseId}/`);
-      const html = fetched.html || "";
       return json({
         ok: true,
-        horseId,
-        status: fetched.status,
-        finalUrl: fetched.finalUrl || fetched.url,
-        htmlLength: html.length,
-        hasRaceTable: html.includes("db_h_race_results"),
-        hasTable: html.includes("<table"),
-        hasAccessDenied: /Access Denied|Forbidden|アクセス|captcha|Cloudflare/i.test(html),
-        head: html.slice(0, 1200)
+        mode: "B-racepage-only",
+        message: "B案ではdb.netkeiba.comの馬個別ページを使いません。前走はrace.netkeiba.comの出馬表内にある場合のみ取得します。"
       });
     }
 
@@ -100,7 +89,7 @@ export default {
 
       return json({
         ok: true,
-        mode: "verify-no-odds-fetchfix",
+        mode: "B-racepage-only",
         validation,
         race,
         horses,
@@ -397,6 +386,9 @@ function parseSex(text) {
 }
 
 async function getShutuba(raceId) {
+  // B案：レースページ完結版
+  // db.netkeiba.com の馬個別ページは使わない。
+  // race.netkeiba.com の出馬表HTMLから取れる範囲だけ取得する。
   const fetched = await fetchHtml(`https://race.netkeiba.com/race/shutuba.html?race_id=${raceId}`);
   const html = fetched.html || "";
 
@@ -407,9 +399,7 @@ async function getShutuba(raceId) {
     const tr = row[1];
 
     const no = cleanText(stripTags(tr.match(/<td[^>]*Umaban[^>]*>([\s\S]*?)<\/td>/i)?.[1] || "")).replace(/\D/g, "");
-
     const frameByHtml = cleanText(stripTags(tr.match(/<td[^>]*Waku[^>]*>([\s\S]*?)<\/td>/i)?.[1] || "")).replace(/\D/g, "");
-
     const frame = frameByHtml || calcJraFrame(no, rows.length);
 
     const horseLink =
@@ -425,13 +415,9 @@ async function getShutuba(raceId) {
 
     const name = cleanText(stripTags(nameRaw));
 
-    // まず出馬表内から取得。不足なら個別馬ページで補完。
-    let last = parseRecentFinishesFromRow(tr);
-
-    if ((!last.last1 || !last.last2 || !last.last3) && horseLink) {
-      const hp = await getHorseLastFinishes(horseLink);
-      if (hp.last1 || hp.last2 || hp.last3) last = hp;
-    }
+    // 出馬表ページ内で取れる場合のみ前走候補を入れる。
+    // 取れなければ空欄。db.netkeibaへは行かない。
+    const last = parseRecentFinishesFromRow(tr);
 
     if (no || name) {
       horses.push({
@@ -449,102 +435,6 @@ async function getShutuba(raceId) {
   }
 
   return horses.sort((a, b) => Number(a.no || 999) - Number(b.no || 999));
-}
-
-async function getHorseLastFinishes(horseId) {
-  // db.netkeiba 個別馬ページから近3走の着順を取得するTD抽出・最終版。
-  // ポイント:
-  // 1) db_h_race_results テーブルを優先
-  // 2) <td> を正規抽出して cols 配列化
-  // 3) 人気・オッズ・馬番・枠番を避け、着順候補だけ採用
-  // 4) テーブルが取れない場合はページ内tr全体をfallback探索
-  const url = `https://db.netkeiba.com/horse/${horseId}/`;
-  const fetched = await fetchHtml(url);
-  const html = fetched.html || "";
-
-  let targetHtml = "";
-
-  const tableMatch =
-    html.match(/<table[^>]*class=["'][^"']*db_h_race_results[^"']*["'][^>]*>[\s\S]*?<\/table>/i) ||
-    html.match(/<table[^>]*db_h_race_results[^>]*>[\s\S]*?<\/table>/i);
-
-  if (tableMatch) {
-    targetHtml = tableMatch[0];
-  } else {
-    // fallback：テーブルclassが取れない場合でも、ページ全体からtr探索する
-    targetHtml = html;
-  }
-
-  const rows = [...targetHtml.matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/gi)];
-  const finishes = [];
-
-  for (const row of rows) {
-    const rowHtml = row[1];
-
-    // ヘッダー除外
-    if (/<th[\s\S]*?>/i.test(rowHtml)) continue;
-
-    const cols = extractTdValues(rowHtml);
-
-    // 戦績行でないものを除外
-    if (cols.length < 8) continue;
-
-    // 戦績行判定：日付が先頭付近にあることを優先
-    const hasDate = cols.slice(0, 3).some(c => /^\d{4}\/\d{1,2}\/\d{1,2}/.test(c));
-    if (!hasDate) continue;
-
-    const finish = pickSafeFinishFromHorseRow(cols);
-    if (finish) finishes.push(finish);
-
-    if (finishes.length >= 3) break;
-  }
-
-  return {
-    last1: finishes[0] || "",
-    last2: finishes[1] || "",
-    last3: finishes[2] || ""
-  };
-}
-
-function extractTdValues(rowHtml) {
-  const tdMatches = [...String(rowHtml || "").matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi)];
-
-  return tdMatches.map(m =>
-    cleanText(
-      stripTags(m[1])
-        .replace(/\r?\n/g, " ")
-        .replace(/\t/g, " ")
-    )
-  ).filter(v => v !== "");
-}
-
-function pickSafeFinishFromHorseRow(cols) {
-  // netkeiba DBの標準列:
-  // 0日付,1開催,2天気,3R,4レース名,5映像,6頭数,7枠番,8馬番,9オッズ,10人気,11着順...
-  // まず index 11〜14 を優先。ここが一番人気混入しにくい。
-  const preferredIndexes = [11, 12, 13, 14];
-  for (const idx of preferredIndexes) {
-    const v = normalizeFinishValue(cols[idx]);
-    if (v) return v;
-  }
-
-  // 構造ズレ対策:
-  // ただし 7枠番, 8馬番, 9オッズ, 10人気 は危険なので除外。
-  for (let i = 0; i < cols.length; i++) {
-    if (i === 7 || i === 8 || i === 9 || i === 10) continue;
-
-    const raw = cols[i];
-    const v = normalizeFinishValue(raw);
-
-    if (!v) continue;
-
-    // 日付・開催回・R番号・頭数などの混入防止
-    if (i <= 6) continue;
-
-    return v;
-  }
-
-  return "";
 }
 
 function parseRecentFinishesFromRow(tr) {
