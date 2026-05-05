@@ -2,10 +2,9 @@ name = "testura-race-worker"
 main = "worker.js"
 compatibility_date = "2024-05-01"
 
-# 前走補完APIを使う場合だけ、Cloudflare DashboardのVariables and Secretsで
+# 前走補完でプロキシを使う場合:
+# Workers > Settings > Variables and Secrets
 # PROXY_BASE を設定してください。
 #
 # 例:
 # PROXY_BASE = "https://your-proxy.example.com/fetch?url="
-#
-# PROXY_BASE未設定でも、B案の基本・出馬表・結果・人気計算APIは動きます。

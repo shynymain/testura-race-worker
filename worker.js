@@ -18,14 +18,13 @@ export default {
     if (url.pathname === "/" || url.pathname === "/api/health") {
       return json({
         ok: true,
-        version: "B-plus-last-popularity-20240501",
+        version: "A-proxy-plus-popularity-20240501",
         purpose: "raceId/basic/horses/result from detail, last3 from horse page fallback. odds disabled.",
         endpoints: [
           "/api/health",
           "/api/debug-list?date=2026-05-02",
-          "/api/last-horse?horseId=2023106995",
+          "/api/debug-proxy-horse?horseId=2023106995",
           "/api/calc-popularity?odds=1:2.5,2:2.5,3:4.8,4:10.1",
-          "/api/debug-horse?horseId=2023106995",
           "/api/race?date=2026-05-02&place=京都&raceNo=9",
           "/api/race?date=2026-05-03&place=京都&raceNo=11"
         ]
@@ -39,27 +38,100 @@ export default {
     }
 
     if (url.pathname === "/api/debug-horse") {
+      const horseId = url.searchParams.get("horseId");
+      if (!horseId) return json({ ok: false, error: "horseId required" }, 400);
+
+      const fetched = await fetchHtml(`https://db.netkeiba.com/horse/${horseId}/`);
+      const html = fetched.html || "";
       return json({
         ok: true,
-        mode: "B-plus-last-popularity",
-        message: "B案ではdb.netkeiba.comの馬個別ページを使いません。前走はrace.netkeiba.comの出馬表内にある場合のみ取得します。"
+        horseId,
+        status: fetched.status,
+        finalUrl: fetched.finalUrl || fetched.url,
+        htmlLength: html.length,
+        hasRaceTable: html.includes("db_h_race_results"),
+        hasTable: html.includes("<table"),
+        hasAccessDenied: /Access Denied|Forbidden|アクセス|captcha|Cloudflare/i.test(html),
+        head: html.slice(0, 1200)
       });
     }
 
-    if (url.pathname === "/api/last-horse") {
-      const horseId = url.searchParams.get("horseId");
-      if (!horseId) return json({ ok: false, error: "horseId required" }, 400);
-      return json(await getLastHorseViaProxy(horseId));
+    if (url.pathname === "/api/debug-proxy-horse") {
+      const horseId = url.searchParams.get("horseId") || "2023106995";
+      const directUrl = `https://db.netkeiba.com/horse/${horseId}/`;
+      const target = globalThis.PROXY_BASE
+        ? `${globalThis.PROXY_BASE}${encodeURIComponent(directUrl)}`
+        : directUrl;
+
+      const fetched = await fetchHtml(target);
+      const html = fetched.html || "";
+      return json({
+        ok: true,
+        mode: "A-proxy",
+        horseId,
+        proxyEnabled: !!globalThis.PROXY_BASE,
+        proxyBase: globalThis.PROXY_BASE ? "set" : "not set",
+        status: fetched.status,
+        finalUrl: fetched.finalUrl || fetched.url,
+        htmlLength: html.length,
+        hasRaceTable: html.includes("db_h_race_results"),
+        hasAccessDenied: /Access Denied|Forbidden|captcha|Cloudflare|アクセス/i.test(html),
+        head: html.slice(0, 1000)
+      });
     }
 
     if (url.pathname === "/api/calc-popularity") {
-      // 例: /api/calc-popularity?odds=1:2.5,2:2.5,3:4.8,4:10.1
-      const oddsText = url.searchParams.get("odds") || "";
-      const items = parseOddsQuery(oddsText);
+      const oddsParam = url.searchParams.get("odds");
+      if (!oddsParam) {
+        return json({ ok: false, error: "odds required" }, 400);
+      }
+
+      const list = oddsParam.split(",")
+        .map(v => v.trim())
+        .filter(Boolean)
+        .map(v => {
+          const [no, odds] = v.split(":");
+          return {
+            no: String(no || "").trim(),
+            odds: Number(String(odds || "").trim())
+          };
+        })
+        .filter(x => x.no && Number.isFinite(x.odds) && x.odds > 0);
+
+      const sorted = [...list].sort((a, b) => {
+        if (a.odds !== b.odds) return a.odds - b.odds;
+        return Number(a.no) - Number(b.no);
+      });
+
+      let prevOdds = null;
+      let rank = 0;
+
+      for (let i = 0; i < sorted.length; i++) {
+        const cur = sorted[i];
+
+        if (prevOdds === null || cur.odds !== prevOdds) {
+          rank = i + 1;
+          prevOdds = cur.odds;
+        }
+
+        cur.popularity = String(rank);
+      }
+
+      const data = list
+        .map(x => {
+          const found = sorted.find(s => s.no === x.no);
+          return {
+            no: x.no,
+            odds: String(x.odds),
+            popularity: found ? found.popularity : ""
+          };
+        })
+        .sort((a, b) => Number(a.no) - Number(b.no));
+
       return json({
         ok: true,
-        input: oddsText,
-        horses: applyPopularity(items)
+        mode: "calc-popularity",
+        data
       });
     }
 
@@ -109,7 +181,7 @@ export default {
 
       return json({
         ok: true,
-        mode: "B-plus-last-popularity",
+        mode: "A-proxy-plus-popularity",
         validation,
         race,
         horses,
@@ -406,9 +478,6 @@ function parseSex(text) {
 }
 
 async function getShutuba(raceId) {
-  // B案：レースページ完結版
-  // db.netkeiba.com の馬個別ページは使わない。
-  // race.netkeiba.com の出馬表HTMLから取れる範囲だけ取得する。
   const fetched = await fetchHtml(`https://race.netkeiba.com/race/shutuba.html?race_id=${raceId}`);
   const html = fetched.html || "";
 
@@ -419,7 +488,9 @@ async function getShutuba(raceId) {
     const tr = row[1];
 
     const no = cleanText(stripTags(tr.match(/<td[^>]*Umaban[^>]*>([\s\S]*?)<\/td>/i)?.[1] || "")).replace(/\D/g, "");
+
     const frameByHtml = cleanText(stripTags(tr.match(/<td[^>]*Waku[^>]*>([\s\S]*?)<\/td>/i)?.[1] || "")).replace(/\D/g, "");
+
     const frame = frameByHtml || calcJraFrame(no, rows.length);
 
     const horseLink =
@@ -435,9 +506,13 @@ async function getShutuba(raceId) {
 
     const name = cleanText(stripTags(nameRaw));
 
-    // 出馬表ページ内で取れる場合のみ前走候補を入れる。
-    // 取れなければ空欄。db.netkeibaへは行かない。
-    const last = parseRecentFinishesFromRow(tr);
+    // まず出馬表内から取得。不足なら個別馬ページで補完。
+    let last = parseRecentFinishesFromRow(tr);
+
+    if ((!last.last1 || !last.last2 || !last.last3) && horseLink) {
+      const hp = await getHorseLastFinishes(horseLink);
+      if (hp.last1 || hp.last2 || hp.last3) last = hp;
+    }
 
     if (no || name) {
       horses.push({
@@ -457,42 +532,28 @@ async function getShutuba(raceId) {
   return horses.sort((a, b) => Number(a.no || 999) - Number(b.no || 999));
 }
 
-async function getLastHorseViaProxy(horseId) {
-  // 前走補完API
-  // PROXY_BASE がある場合だけ db.netkeiba.com の馬ページを読む。
-  if (!globalThis.PROXY_BASE) {
-    return {
-      ok: false,
-      mode: "last-horse",
-      horseId,
-      reason: "PROXY_BASE not set",
-      last1: "",
-      last2: "",
-      last3: ""
-    };
+async function getHorseLastFinishes(horseId) {
+  // A案：プロキシ検証版
+  // Workerからdb.netkeiba.comを直接叩くとAccessDeniedになるため、
+  // env.PROXY_BASE があればプロキシ経由でHTMLを取得する。
+  // 例: PROXY_BASE=https://your-proxy.example.com/fetch?url=
+  const directUrl = `https://db.netkeiba.com/horse/${horseId}/`;
+
+  let fetched;
+  if (typeof globalThis.PROXY_BASE !== "undefined" && globalThis.PROXY_BASE) {
+    fetched = await fetchHtml(`${globalThis.PROXY_BASE}${encodeURIComponent(directUrl)}`);
+  } else {
+    // envが使えない環境向け fallback。直接取得も試すが、ブロックされる可能性が高い。
+    fetched = await fetchHtml(directUrl);
   }
 
-  const directUrl = `https://db.netkeiba.com/horse/${horseId}/`;
-  const fetched = await fetchHtml(`${globalThis.PROXY_BASE}${encodeURIComponent(directUrl)}`);
   const html = fetched.html || "";
 
   const tableMatch =
     html.match(/<table[^>]*class=["'][^"']*db_h_race_results[^"']*["'][^>]*>[\s\S]*?<\/table>/i) ||
     html.match(/<table[^>]*db_h_race_results[^>]*>[\s\S]*?<\/table>/i);
 
-  if (!tableMatch) {
-    return {
-      ok: false,
-      mode: "last-horse",
-      horseId,
-      status: fetched.status,
-      hasRaceTable: false,
-      htmlLength: html.length,
-      last1: "",
-      last2: "",
-      last3: ""
-    };
-  }
+  if (!tableMatch) return { last1: "", last2: "", last3: "" };
 
   const table = tableMatch[0];
   const rows = [...table.matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/gi)];
@@ -514,11 +575,6 @@ async function getLastHorseViaProxy(horseId) {
   }
 
   return {
-    ok: finishes.length > 0,
-    mode: "last-horse",
-    horseId,
-    status: fetched.status,
-    hasRaceTable: true,
     last1: finishes[0] || "",
     last2: finishes[1] || "",
     last3: finishes[2] || ""
@@ -533,18 +589,15 @@ function extractTdValues(rowHtml) {
 }
 
 function pickSafeFinishFromHorseRow(cols) {
-  // 人気・オッズ・枠番・馬番の混入を避けるため、着順標準位置を優先
   const preferredIndexes = [11, 12, 13, 14];
-
   for (const idx of preferredIndexes) {
     const v = normalizeFinishValue(cols[idx]);
     if (v) return v;
   }
 
   for (let i = 0; i < cols.length; i++) {
-    if (i <= 6) continue;
     if (i === 7 || i === 8 || i === 9 || i === 10) continue;
-
+    if (i <= 6) continue;
     const v = normalizeFinishValue(cols[i]);
     if (v) return v;
   }
@@ -552,81 +605,6 @@ function pickSafeFinishFromHorseRow(cols) {
   return "";
 }
 
-function normalizeFinishValue(raw) {
-  let t = cleanText(String(raw || ""))
-    .replace(/[()（）]/g, "")
-    .replace(/着$/g, "")
-    .trim();
-
-  if (!t || t === "-" || t === "－" || t === "—") return "";
-
-  if (/^(中止|除外|取消|取|除|中|競走中止)$/.test(t)) return "0";
-
-  const m = t.match(/^(\d{1,2})着$/);
-  if (m) {
-    const n = Number(m[1]);
-    if (n >= 1 && n <= 18) return String(n);
-  }
-
-  if (/^\d{1,2}$/.test(t)) {
-    const n = Number(t);
-    if (n >= 1 && n <= 18) return String(n);
-  }
-
-  return "";
-}
-
-function parseOddsQuery(text) {
-  return String(text || "")
-    .split(",")
-    .map(s => s.trim())
-    .filter(Boolean)
-    .map(part => {
-      const pair = part.split(":");
-      const no = String(pair[0] || "").trim();
-      const odds = String(pair[1] || "").trim();
-      return { no, odds, popularity: "" };
-    })
-    .filter(x => x.no && x.odds);
-}
-
-function applyPopularity(items) {
-  // 単勝オッズ昇順で人気を自動計算。
-  // 同オッズは同人気。例: 1人気, 2人気, 3人気, 3人気, 5人気
-  const horses = items.map(x => ({
-    ...x,
-    oddsNum: Number(String(x.odds).replace(/[^\d.]/g, ""))
-  }));
-
-  const valid = horses
-    .filter(h => Number.isFinite(h.oddsNum) && h.oddsNum > 0)
-    .sort((a, b) => a.oddsNum - b.oddsNum || Number(a.no) - Number(b.no));
-
-  let prevOdds = null;
-  let currentRank = 0;
-
-  for (let i = 0; i < valid.length; i++) {
-    const h = valid[i];
-
-    if (prevOdds === null || h.oddsNum !== prevOdds) {
-      currentRank = i + 1;
-      prevOdds = h.oddsNum;
-    }
-
-    h.popularity = String(currentRank);
-  }
-
-  return horses
-    .map(h => {
-      const found = valid.find(v => v.no === h.no);
-      return {
-        no: h.no,
-        odds: h.odds,
-        popularity: found ? found.popularity : ""
-      };
-    })
-    .sort((a, b) => Number(a.no) - Number(b.no));
-}
 
 
 function parseRecentFinishesFromRow(tr) {
