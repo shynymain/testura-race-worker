@@ -1,6 +1,6 @@
-// testura-race-worker 検証用 raceName修正版
-// 目的：netkeibaから「基本・枠・馬番・馬名・前走着順候補・結果」を取得
-// 注意：オッズ取得は完全に外す。odds/popularity は空で返す。
+// testura-race-worker 検証用 no-odds 詳細ページraceName優先版
+// 一覧ページでは raceId だけ取得。raceName は /race/shutuba.html の詳細ページから取得。
+// オッズ取得は完全OFF。odds/popularity は空。
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
@@ -17,8 +17,8 @@ export default {
     if (url.pathname === "/" || url.pathname === "/api/health") {
       return json({
         ok: true,
-        version: "verify-no-odds-racenamefix-20240501",
-        purpose: "netkeiba basic/shutuba/result verification. odds disabled.",
+        version: "verify-no-odds-detail-racename-20240501",
+        purpose: "raceId from list, raceName/basic/horses/result from detail. odds disabled.",
         endpoints: [
           "/api/health",
           "/api/debug-list?date=2026-05-02",
@@ -45,7 +45,6 @@ export default {
 
       const listData = await getRaceList(date, false);
       const races = listData.races || [];
-
       const target = races.find(r =>
         r.place.includes(place) &&
         String(Number(r.raceNo)) === String(Number(raceNo))
@@ -72,7 +71,8 @@ export default {
         place,
         raceNo: String(Number(raceNo)),
         raceId: target.raceId,
-        raceName: raceBasic.raceName || sanitizeRaceName(target.raceName) || "",
+        // 一覧ページの raceName は使わない。詳細ページだけを信頼する。
+        raceName: raceBasic.raceName || "",
         headcount: String(horses.length)
       };
 
@@ -80,7 +80,7 @@ export default {
 
       return json({
         ok: true,
-        mode: "verify-no-odds",
+        mode: "verify-no-odds-detail-racename",
         validation,
         race,
         horses,
@@ -150,7 +150,14 @@ async function getRaceList(date, includeDebug = false) {
     const races = parseRaceListHtml(html);
 
     if (races.length > 0) {
-      return { ok: true, date, sourceUrl: targetUrl, status: fetched.status, count: races.length, races };
+      return {
+        ok: true,
+        date,
+        sourceUrl: targetUrl,
+        status: fetched.status,
+        count: races.length,
+        races
+      };
     }
 
     lastInfo = {
@@ -163,7 +170,14 @@ async function getRaceList(date, includeDebug = false) {
     };
   }
 
-  return { ok: true, date, status: "no races parsed", count: 0, races: [], debug: includeDebug ? lastInfo : undefined };
+  return {
+    ok: true,
+    date,
+    status: "no races parsed",
+    count: 0,
+    races: [],
+    debug: includeDebug ? lastInfo : undefined
+  };
 }
 
 function parseRaceListHtml(html) {
@@ -177,22 +191,19 @@ function parseRaceListHtml(html) {
     seen.add(raceId);
 
     const raceNo = String(Number(raceId.slice(-2)));
-    const around = html.slice(Math.max(0, m.index - 900), Math.min(html.length, m.index + 900));
+    const around = html.slice(Math.max(0, m.index - 700), Math.min(html.length, m.index + 700));
     const aroundText = stripTags(around);
 
     let place = detectPlace(aroundText);
     if (!place) place = placeFromRaceId(raceId);
     if (!place) continue;
 
-    const raceName =
-      extractRaceNameFromAround(around, raceId, raceNo) ||
-      guessRaceName(aroundText, raceNo);
-
+    // debug-listではraceNameを無理に取らない。一覧は不安定なので空で返す。
     races.push({
       place,
       raceNo,
       raceId,
-      raceName: sanitizeRaceName(raceName)
+      raceName: ""
     });
   }
 
@@ -200,56 +211,6 @@ function parseRaceListHtml(html) {
     if (a.place !== b.place) return a.place.localeCompare(b.place, "ja");
     return Number(a.raceNo) - Number(b.raceNo);
   });
-}
-
-function extractRaceNameFromAround(html, raceId, raceNo) {
-  const clean = String(html || "");
-
-  // href 内に race_id=12桁があるリンク周辺から、レース名らしきテキストを拾う
-  const patterns = [
-    new RegExp(`<a[^>]+race_id=${raceId}[^>]*>([\\s\\S]*?)<\\/a>`, "i"),
-    new RegExp(`<a[^>]+/race/(?:result|shutuba)?[^>]*${raceId}[^>]*>([\\s\\S]*?)<\\/a>`, "i"),
-    new RegExp(`<a[^>]+${raceId}[^>]*>([\\s\\S]*?)<\\/a>`, "i")
-  ];
-
-  for (const p of patterns) {
-    const m = clean.match(p);
-    if (m && m[1]) {
-      const t = sanitizeRaceName(stripTags(m[1]));
-      if (t) return t;
-    }
-  }
-
-  // 「9R レース名」形式
-  const txt = stripTags(clean);
-  const m1 = txt.match(new RegExp(`${raceNo}\\s*R\\s+([^\\s]+)`));
-  if (m1 && m1[1]) return sanitizeRaceName(m1[1]);
-
-  // data-title / title 属性の保険
-  const attr = clean.match(/(?:data-title|title)=["']([^"']+)["']/i);
-  if (attr && attr[1]) return sanitizeRaceName(attr[1]);
-
-  return "";
-}
-
-function sanitizeRaceName(s) {
-  let t = cleanText(String(s || ""))
-    .replace(/-->/g, "")
-    .replace(/→/g, "")
-    .replace(/▶/g, "")
-    .replace(/出馬表.*$/g, "")
-    .replace(/結果.*$/g, "")
-    .replace(/オッズ.*$/g, "")
-    .replace(/^\d+\s*R\s*/g, "")
-    .trim();
-
-  if (!t || t === "-" || t === "--" || t === "ー" || t === "⇒") return "";
-
-  // 明らかにレース名ではないものを除外
-  const ng = ["Race", "レース一覧", "開催", "競馬", "netkeiba"];
-  if (ng.some(x => t.includes(x))) return "";
-
-  return t;
 }
 
 function detectPlace(text) {
@@ -274,32 +235,11 @@ function placeFromRaceId(raceId) {
   return map[code] || "";
 }
 
-function guessRaceName(text, raceNo) {
-  const t = cleanText(text);
-  const patterns = [
-    new RegExp(`${raceNo}R\\s+([^\\s]+)`),
-    new RegExp(`${raceNo}\\s*R\\s+([^\\s]+)`)
-  ];
-
-  for (const p of patterns) {
-    const m = t.match(p);
-    if (m && m[1]) return sanitizeRaceName(m[1]);
-  }
-
-  return "";
-}
-
 async function getRaceBasic(raceId, date, place, raceNo) {
   const fetched = await fetchHtml(`https://race.netkeiba.com/race/shutuba.html?race_id=${raceId}`);
   const html = fetched.html || "";
 
-  const title = cleanText(stripTags(html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1] || ""));
-  const h1 = cleanText(stripTags(html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i)?.[1] || ""));
-
-  let raceName = cleanupRaceName(h1 || title.split("|")[0].trim());
-
-  // shutuba側で「矢車賞(1勝クラス) 出馬表」の形ならレース名だけ整形
-  raceName = sanitizeRaceName(raceName.replace(/\(.+?\)/g, ""));
+  const raceName = extractRaceNameFromDetail(html);
 
   const infoText = stripTags(html);
 
@@ -313,12 +253,52 @@ async function getRaceBasic(raceId, date, place, raceNo) {
   return { date, place, raceNo, raceName, surface, distance, grade, condition, age, sex };
 }
 
-function cleanupRaceName(s) {
-  return cleanText(String(s || "")
-    .replace(/出馬表.*$/, "")
-    .replace(/結果.*$/, "")
-    .replace(/オッズ.*$/, "")
-  );
+function extractRaceNameFromDetail(html) {
+  let raceName = "";
+
+  // h1優先
+  const h1 = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
+  if (h1 && h1[1]) {
+    raceName = stripTags(h1[1]);
+  }
+
+  // title fallback
+  if (!raceName) {
+    const title = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+    if (title && title[1]) {
+      raceName = stripTags(title[1].split("|")[0]);
+    }
+  }
+
+  // og:title fallback
+  if (!raceName) {
+    const og = html.match(/property=["']og:title["'][^>]*content=["']([^"']+)["']/i);
+    if (og && og[1]) {
+      raceName = cleanText(og[1]);
+    }
+  }
+
+  return sanitizeRaceName(raceName);
+}
+
+function sanitizeRaceName(s) {
+  let t = cleanText(String(s || ""))
+    .replace(/-->/g, "")
+    .replace(/→/g, "")
+    .replace(/▶/g, "")
+    .replace(/出馬表.*$/g, "")
+    .replace(/結果.*$/g, "")
+    .replace(/オッズ.*$/g, "")
+    .replace(/^\d+\s*R\s*/g, "")
+    .replace(/\(.+?\)/g, "")
+    .trim();
+
+  if (!t || t === "-" || t === "--" || t === "ー" || t === "⇒") return "";
+
+  const ng = ["Race", "レース一覧", "開催", "競馬", "netkeiba"];
+  if (ng.some(x => t.includes(x))) return "";
+
+  return t;
 }
 
 function parseSurface(text) {
