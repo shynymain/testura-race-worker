@@ -17,7 +17,7 @@ export default {
     if (url.pathname === "/" || url.pathname === "/api/health") {
       return json({
         ok: true,
-        version: "verify-no-odds-lastfix-20240501",
+        version: "verify-no-odds-lastfix-v2-v2-20240501",
         purpose: "raceId from list, raceName/basic/horses/result from detail. odds disabled.",
         endpoints: [
           "/api/health",
@@ -80,7 +80,7 @@ export default {
 
       return json({
         ok: true,
-        mode: "verify-no-odds-lastfix",
+        mode: "verify-no-odds-lastfix-v2",
         validation,
         race,
         horses,
@@ -384,44 +384,108 @@ async function getShutuba(raceId) {
 }
 
 function parseRecentFinishesFromRow(tr) {
-  // 前走着順取得 強化版
-  // tr全体ではなく td単位で後ろ側から「着順らしいセル」だけ拾う。
-  // 目的：騎手・斤量・日付・馬体重などの数字混入を減らす。
-  const cols = [...String(tr || "").matchAll(/<td[^>]*>([\s\S]*?)<\/td>/g)]
-    .map(x => stripTags(x[1]))
-    .map(x => cleanText(x))
-    .filter(Boolean);
+  // 前走着順取得 v2
+  // 方針：td配列化 → 末尾側の候補列だけを見る → 着順らしい値を最大3つ取得
+  // 前走/前2走/前3走が取れない場合は空欄。誤取得より空欄優先。
+  const tdHtmls = [...String(tr || "").matchAll(/<td[^>]*>([\s\S]*?)<\/td>/g)].map(x => x[1]);
 
-  const nums = [];
-
-  // 後ろ側に近走成績があるケースが多いため、後ろから確認
-  for (let i = cols.length - 1; i >= 0; i--) {
-    const t = cols[i]
-      .replace(/[()（）]/g, "")
-      .replace(/着$/g, "")
-      .trim();
-
-    // 中止・除外・取消は 0 扱い
-    if (/^(中止|除外|取消|取|除|中)$/.test(t)) {
-      nums.push("0");
-    } else if (/^\d{1,2}$/.test(t)) {
-      const n = Number(t);
-      if (n >= 1 && n <= 18) nums.push(String(n));
-    }
-
-    if (nums.length >= 3) break;
-  }
-
-  if (nums.length < 3) {
+  if (!tdHtmls.length) {
     return { last1: "", last2: "", last3: "" };
   }
 
-  // 後ろから拾った順を「前走→前2走→前3走」として返す
-  return {
-    last1: nums[0] || "",
-    last2: nums[1] || "",
-    last3: nums[2] || ""
-  };
+  const cols = tdHtmls
+    .map(x => cleanText(stripTags(x)))
+    .map(x => x.replace(/[()（）]/g, "").replace(/着$/g, "").trim());
+
+  // netkeibaの出馬表は、近走/成績系の列が後方寄りに出るケースが多い。
+  // ただし馬体重・斤量・年齢・人気などの数字も混ざるため、末尾全部ではなく候補幅を絞る。
+  const candidateRanges = [
+    cols.slice(-10, -1),
+    cols.slice(-12, -1),
+    cols.slice(-14, -1),
+    cols.slice(-10),
+    cols
+  ];
+
+  for (const range of candidateRanges) {
+    const finishes = [];
+
+    for (const raw of range) {
+      const v = normalizeFinishValue(raw);
+      if (v) finishes.push(v);
+      if (finishes.length >= 3) break;
+    }
+
+    if (finishes.length >= 3 && looksSafeFinishSet(finishes)) {
+      return {
+        last1: finishes[0] || "",
+        last2: finishes[1] || "",
+        last3: finishes[2] || ""
+      };
+    }
+  }
+
+  // HTML内のclass名が近走系/着順系のセルだけを狙う保険
+  const classTargetCells = [...String(tr || "").matchAll(
+    /<td[^>]*(?:Result|Chakujun|Past|Recent|RaceData|Order|Rank|txt_r)[^>]*>([\s\S]*?)<\/td>/gi
+  )].map(x => normalizeFinishValue(stripTags(x[1]))).filter(Boolean);
+
+  if (classTargetCells.length >= 3 && looksSafeFinishSet(classTargetCells)) {
+    return {
+      last1: classTargetCells[0] || "",
+      last2: classTargetCells[1] || "",
+      last3: classTargetCells[2] || ""
+    };
+  }
+
+  return { last1: "", last2: "", last3: "" };
+}
+
+function normalizeFinishValue(raw) {
+  let t = cleanText(String(raw || ""))
+    .replace(/[()（）]/g, "")
+    .replace(/着$/g, "")
+    .replace(/^\s+|\s+$/g, "");
+
+  if (!t || t === "-" || t === "－" || t === "—") return "";
+
+  // 中止・除外・取消は0扱い
+  if (/^(中止|除外|取消|取|除|中|競走中止)$/.test(t)) return "0";
+
+  // 「1着」「12着」など
+  const mFinish = t.match(/^(\d{1,2})着$/);
+  if (mFinish) {
+    const n = Number(mFinish[1]);
+    if (n >= 1 && n <= 18) return String(n);
+  }
+
+  // 数字単独のみ。斤量55.0、距離1600、日付などは除外。
+  if (/^\d{1,2}$/.test(t)) {
+    const n = Number(t);
+    if (n >= 1 && n <= 18) return String(n);
+  }
+
+  return "";
+}
+
+function looksSafeFinishSet(arr) {
+  if (!Array.isArray(arr) || arr.length < 3) return false;
+
+  const first3 = arr.slice(0, 3);
+
+  // 全部空ではない
+  if (first3.every(x => !x)) return false;
+
+  // 0〜18のみ
+  for (const v of first3) {
+    if (!/^\d{1,2}$/.test(String(v))) return false;
+    const n = Number(v);
+    if (n < 0 || n > 18) return false;
+  }
+
+  // 近走3つとして明らかに不自然なケースは除外しない。
+  // 空欄より取得を優先するが、日付や距離は normalizeFinishValue で除外済み。
+  return true;
 }
 
 function calcJraFrame(no, headcount) {
